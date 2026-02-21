@@ -16,7 +16,23 @@ const SOURCE_PROPERTY = "hs_latest_source";
 const PAGE_SIZE = 100;
 const BATCH_LIMIT = 300; // contacts per batch call
 
-const MARKETING_SOURCES = new Set([
+// All possible hs_latest_source values in HubSpot
+const ALL_SOURCES = [
+  { value: "ORGANIC_SEARCH", label: "Organic Search" },
+  { value: "PAID_SEARCH", label: "Paid Search" },
+  { value: "EMAIL_MARKETING", label: "Email Marketing" },
+  { value: "SOCIAL_MEDIA", label: "Social Media" },
+  { value: "REFERRALS", label: "Referrals" },
+  { value: "OTHER_CAMPAIGNS", label: "Other Campaigns" },
+  { value: "PAID_SOCIAL", label: "Paid Social" },
+  { value: "DISPLAY_ADS", label: "Display Ads" },
+  { value: "DIRECT_TRAFFIC", label: "Direct Traffic" },
+  { value: "OFFLINE", label: "Offline Sources" },
+  { value: "OTHER", label: "Other" },
+];
+
+// Default marketing sources (used if portal hasn't configured their own)
+const DEFAULT_MARKETING_SOURCES = [
   "ORGANIC_SEARCH",
   "PAID_SEARCH",
   "EMAIL_MARKETING",
@@ -25,7 +41,32 @@ const MARKETING_SOURCES = new Set([
   "OTHER_CAMPAIGNS",
   "PAID_SOCIAL",
   "DISPLAY_ADS",
-]);
+];
+
+// ---- Portal Config (per-portal marketing source selections) ----
+const PORTAL_CONFIG_PATH = process.env.PORTAL_CONFIG_PATH || "./data/portal-config.json";
+
+function loadPortalConfig() {
+  try {
+    if (!fs.existsSync(PORTAL_CONFIG_PATH)) return {};
+    return JSON.parse(fs.readFileSync(PORTAL_CONFIG_PATH, "utf8"));
+  } catch {
+    return {};
+  }
+}
+
+function savePortalConfig(config) {
+  fs.writeFileSync(PORTAL_CONFIG_PATH, JSON.stringify(config, null, 2), "utf8");
+}
+
+function getMarketingSources(portalId) {
+  const config = loadPortalConfig();
+  const portalSources = config[String(portalId)]?.marketingSources;
+  if (Array.isArray(portalSources)) {
+    return new Set(portalSources);
+  }
+  return new Set(DEFAULT_MARKETING_SOURCES);
+}
 
 // ---- Helpers ----
 function escapeHtml(str) {
@@ -147,24 +188,29 @@ async function hubspotApi(portalId, url, options = {}) {
 }
 
 /**
- * Compute marketing contribution % based on source history changes.
+ * Compute marketing contribution % based on source history entries.
+ * Includes the very first value (not just changes).
+ * @param {Array} historyEntries - property history entries
+ * @param {Set} marketingSources - set of source values considered "marketing"
  */
-function computeMarketingContribution(historyEntries) {
+function computeMarketingContribution(historyEntries, marketingSources) {
   const entries = [...(historyEntries || [])].sort((a, b) => {
     return Number(a?.timestamp || 0) - Number(b?.timestamp || 0);
   });
 
-  if (entries.length <= 1) {
+  if (entries.length === 0) {
     return { percent: 0, totalChanges: 0, marketingChanges: 0 };
   }
 
   let totalChanges = 0;
   let marketingChanges = 0;
 
-  for (let i = 1; i < entries.length; i++) {
+  // Start from index 0 to include the very first traffic source value
+  for (let i = 0; i < entries.length; i++) {
     const newValue = String(entries[i]?.value ?? "").trim();
+    if (!newValue) continue; // skip empty values
     totalChanges++;
-    if (MARKETING_SOURCES.has(newValue)) marketingChanges++;
+    if (marketingSources.has(newValue)) marketingChanges++;
   }
 
   const percent = totalChanges > 0 ? marketingChanges / totalChanges : 0;
@@ -210,8 +256,11 @@ async function ensurePropertyExists(portalId) {
 
 /**
  * Process a single contact: fetch history, compute %, update property.
+ * Uses the portal's configured marketing sources.
  */
 async function processContact(portalId, contactId) {
+  const marketingSources = getMarketingSources(portalId);
+
   const data = await hubspotApi(
     portalId,
     `https://api.hubapi.com/crm/v3/objects/contacts/${contactId}?propertiesWithHistory=${SOURCE_PROPERTY}`,
@@ -221,8 +270,8 @@ async function processContact(portalId, contactId) {
   const history =
     data?.propertiesWithHistory?.[SOURCE_PROPERTY] || [];
 
-  const { percent, totalChanges } = computeMarketingContribution(history);
-  const value = totalChanges === 0 ? 0 : parseFloat(percent.toFixed(2));
+  const { percent, totalChanges } = computeMarketingContribution(history, marketingSources);
+  const value = totalChanges === 0 ? 0 : parseFloat(percent.toFixed(4));
 
   await hubspotApi(
     portalId,
@@ -451,6 +500,60 @@ app.get("/api/calculate-contribution/status", async (req, res) => {
       : status.error
         ? `Error: ${status.error}`
         : `Complete! Processed ${status.processed} contacts. Updated: ${status.updated}, Zero-history: ${status.skippedNoHistory}, Failed: ${status.failed}.`,
+  });
+});
+
+// ================================================================
+// MARKETING SOURCES CONFIGURATION
+// Let each portal choose which traffic sources count as "marketing"
+// ================================================================
+app.get("/api/marketing-sources", async (req, res) => {
+  const portalId = req.query.portalId;
+  if (!portalId) {
+    return res.status(400).json({ success: false, message: "Missing portalId" });
+  }
+
+  const config = loadPortalConfig();
+  const portalSources = config[String(portalId)]?.marketingSources;
+  const selectedSources = Array.isArray(portalSources) ? portalSources : DEFAULT_MARKETING_SOURCES;
+
+  return res.json({
+    success: true,
+    allSources: ALL_SOURCES,
+    selectedSources,
+  });
+});
+
+app.post("/api/marketing-sources", async (req, res) => {
+  const portalId = req.query.portalId;
+  if (!portalId) {
+    return res.status(400).json({ success: false, message: "Missing portalId" });
+  }
+
+  const { selectedSources } = req.body || {};
+  if (!Array.isArray(selectedSources)) {
+    return res.status(400).json({ success: false, message: "selectedSources must be an array" });
+  }
+
+  // Validate that all provided sources are valid
+  const validValues = new Set(ALL_SOURCES.map((s) => s.value));
+  const invalid = selectedSources.filter((s) => !validValues.has(s));
+  if (invalid.length > 0) {
+    return res.status(400).json({ success: false, message: `Invalid sources: ${invalid.join(", ")}` });
+  }
+
+  const config = loadPortalConfig();
+  config[String(portalId)] = {
+    ...(config[String(portalId)] || {}),
+    marketingSources: selectedSources,
+    updatedAt: new Date().toISOString(),
+  };
+  savePortalConfig(config);
+
+  return res.json({
+    success: true,
+    message: `Saved ${selectedSources.length} marketing sources. Run analysis again to recalculate with the new settings.`,
+    selectedSources,
   });
 });
 

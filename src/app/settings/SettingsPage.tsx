@@ -1,4 +1,4 @@
-import React, { useState, useCallback } from "react";
+import React, { useState, useEffect, useCallback } from "react";
 import {
   Button,
   Flex,
@@ -7,6 +7,7 @@ import {
   Tab,
   Divider,
   Tag,
+  Checkbox,
 } from "@hubspot/ui-extensions";
 import { hubspot } from "@hubspot/ui-extensions";
 
@@ -15,11 +16,83 @@ hubspot.extend<"settings">(({ context }) => <SettingsPage context={context} />);
 const BACKEND_URL = "https://api.uspeh.co.uk";
 
 type AnyObj = Record<string, any>;
+type SourceOption = { value: string; label: string };
 
 const SettingsPage = ({ context }: AnyObj) => {
   const [loading, setLoading] = useState(false);
   const [message, setMessage] = useState("");
   const [statusInfo, setStatusInfo] = useState<AnyObj | null>(null);
+
+  // Source configuration state
+  const [allSources, setAllSources] = useState<SourceOption[]>([]);
+  const [selectedSources, setSelectedSources] = useState<string[]>([]);
+  const [sourcesLoading, setSourcesLoading] = useState(true);
+  const [sourcesMessage, setSourcesMessage] = useState("");
+  const [sourcesSaving, setSourcesSaving] = useState(false);
+
+  /**
+   * Load the current marketing source configuration on mount.
+   */
+  useEffect(() => {
+    const loadSources = async () => {
+      try {
+        const resp = await hubspot.fetch(
+          `${BACKEND_URL}/api/marketing-sources`,
+          { method: "GET" }
+        );
+        const data = await resp.json();
+        if (data.success) {
+          setAllSources(data.allSources || []);
+          setSelectedSources(data.selectedSources || []);
+        }
+      } catch (e: any) {
+        console.error("Failed to load sources:", e);
+      } finally {
+        setSourcesLoading(false);
+      }
+    };
+    loadSources();
+  }, []);
+
+  /**
+   * Toggle a source on/off.
+   */
+  const toggleSource = (sourceValue: string, checked: boolean) => {
+    setSelectedSources((prev) => {
+      if (checked) {
+        return [...prev, sourceValue];
+      } else {
+        return prev.filter((s) => s !== sourceValue);
+      }
+    });
+  };
+
+  /**
+   * Save the selected marketing sources.
+   */
+  const saveSources = async () => {
+    setSourcesSaving(true);
+    setSourcesMessage("");
+    try {
+      const resp = await hubspot.fetch(
+        `${BACKEND_URL}/api/marketing-sources`,
+        {
+          method: "POST",
+          body: { selectedSources },
+        }
+      );
+      const data = await resp.json();
+      if (data.success) {
+        setSourcesMessage(data.message);
+      } else {
+        throw new Error(data.message || "Failed to save");
+      }
+    } catch (e: any) {
+      setSourcesMessage(`Error: ${e?.message || "Failed to save sources"}`);
+    } finally {
+      setSourcesSaving(false);
+    }
+  };
 
   /**
    * Poll the status endpoint until the job is complete.
@@ -38,7 +111,6 @@ const SettingsPage = ({ context }: AnyObj) => {
           setMessage(
             `Processing... ${data.processed} contacts done so far.`
           );
-          // Poll again after 3 seconds
           setTimeout(poll, 3000);
         } else if (data.status === "completed") {
           setMessage(
@@ -61,7 +133,7 @@ const SettingsPage = ({ context }: AnyObj) => {
   }, []);
 
   /**
-   * Kick off the full analysis — responds instantly, then we poll for progress.
+   * Kick off the full analysis.
    */
   const runFullAnalysis = async () => {
     setLoading(true);
@@ -84,13 +156,11 @@ const SettingsPage = ({ context }: AnyObj) => {
       }
 
       if (result.status === "running") {
-        // Already running from a previous click
         setMessage(result.message);
       } else {
         setMessage("Analysis started! Tracking progress...");
       }
 
-      // Start polling for status
       setTimeout(() => pollStatus(), 2000);
     } catch (error: any) {
       const detail =
@@ -108,15 +178,18 @@ const SettingsPage = ({ context }: AnyObj) => {
         Marketing Helper Settings
       </Text>
 
-      <Tabs defaultSelected="actions">
+      <Tabs defaultSelected="sources">
         <Tab tabId="overview" title="Overview">
           <Flex direction="column" gap="medium">
             <Text>
               This app calculates the Marketing Contribution Percentage for each
               contact. It analyses the hs_latest_source property history to
-              determine what percentage of source changes came from marketing
-              channels (organic search, paid search, email marketing, social
-              media, referrals, paid social, display ads, etc.)
+              determine what percentage of source values came from marketing
+              channels.
+            </Text>
+            <Text format={{ fontSize: "small" }}>
+              You can configure which traffic sources count as
+              &quot;marketing&quot; in the Configure Sources tab.
             </Text>
             <Text format={{ fontSize: "small", color: "subtle" }}>
               Powered by uspeh
@@ -124,23 +197,78 @@ const SettingsPage = ({ context }: AnyObj) => {
           </Flex>
         </Tab>
 
+        <Tab tabId="sources" title="Configure Sources">
+          <Flex direction="column" gap="large">
+            <Text>
+              Select which traffic sources should be counted as
+              &quot;marketing&quot; when calculating the Marketing Contribution
+              Percentage. Any source not selected will be treated as
+              non-marketing.
+            </Text>
+
+            {sourcesLoading ? (
+              <Text format={{ fontSize: "small", color: "subtle" }}>
+                Loading source options...
+              </Text>
+            ) : (
+              <Flex direction="column" gap="small">
+                {allSources.map((source) => (
+                  <Checkbox
+                    key={source.value}
+                    checked={selectedSources.includes(source.value)}
+                    onChange={(checked: boolean) =>
+                      toggleSource(source.value, checked)
+                    }
+                  >
+                    {source.label}
+                  </Checkbox>
+                ))}
+              </Flex>
+            )}
+
+            <Flex direction="row" gap="small">
+              <Button
+                onClick={saveSources}
+                disabled={sourcesSaving || sourcesLoading}
+                variant="primary"
+              >
+                {sourcesSaving ? "Saving..." : "Save Source Settings"}
+              </Button>
+              <Text format={{ fontSize: "small", color: "subtle" }}>
+                {selectedSources.length} source(s) selected as marketing
+              </Text>
+            </Flex>
+
+            {sourcesMessage && (
+              <Text
+                format={{
+                  color: sourcesMessage.startsWith("Error")
+                    ? "error"
+                    : "success",
+                }}
+              >
+                {sourcesMessage}
+              </Text>
+            )}
+          </Flex>
+        </Tab>
+
         <Tab tabId="actions" title="Run Analysis">
           <Flex direction="column" gap="large">
             <Text>
               Click the button below to calculate Marketing Contribution
-              Percentage for your entire contact database. The system
-              processes all contacts in the background — you can check
-              progress below.
+              Percentage for your entire contact database. The system processes
+              all contacts in the background.
             </Text>
 
             <Text format={{ fontSize: "small" }}>
               This will:{"\n"}&bull; Create the &quot;Marketing Contribution
               Percentage&quot; property (if it doesn&apos;t exist){"\n"}&bull;
-              Read each contact&apos;s hs_latest_source property history{"\n"}
-              &bull; Calculate the % of marketing-attributed source changes
-              {"\n"}&bull; Update each contact with the calculated percentage
-              {"\n"}&bull; Automatically continue until all contacts are
-              processed
+              Read each contact&apos;s full hs_latest_source property history
+              (including the initial value){"\n"}&bull; Calculate the % based on
+              your configured marketing sources{"\n"}&bull; Update each contact
+              with the calculated percentage{"\n"}&bull; Automatically continue
+              until all contacts are processed
             </Text>
 
             <Button
@@ -155,8 +283,8 @@ const SettingsPage = ({ context }: AnyObj) => {
               <Flex direction="column" gap="small">
                 <Text format={{ fontSize: "small", color: "subtle" }}>
                   {statusInfo.processed} contacts processed &middot;{" "}
-                  {statusInfo.updated} updated &middot;{" "}
-                  {statusInfo.failed} failed
+                  {statusInfo.updated} updated &middot; {statusInfo.failed}{" "}
+                  failed
                 </Text>
               </Flex>
             )}
@@ -186,7 +314,8 @@ const SettingsPage = ({ context }: AnyObj) => {
               The app is configured to listen for changes to the
               hs_latest_source property on contacts. When a contact&apos;s
               traffic source changes, the Marketing Contribution Percentage is
-              automatically recalculated.
+              automatically recalculated using your configured marketing
+              sources.
             </Text>
 
             <Divider />
@@ -203,9 +332,9 @@ const SettingsPage = ({ context }: AnyObj) => {
             <Divider />
 
             <Text format={{ fontSize: "small", color: "subtle" }}>
-              Tip: Run the Full Analysis first to set initial values for all
-              existing contacts, then the webhook keeps everything up to date
-              going forward.
+              Tip: Configure your marketing sources first, then run the Full
+              Analysis to set initial values. The webhook keeps everything up to
+              date going forward.
             </Text>
           </Flex>
         </Tab>

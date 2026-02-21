@@ -389,7 +389,7 @@ app.get("/refresh", async (req, res) => {
 // Called from the settings page via hubspot.fetch()
 // HubSpot adds ?portalId=xxx&userId=xxx&userEmail=xxx&appId=xxx
 // ================================================================
-// In-memory job status tracker
+// In-memory job status tracker (survives page navigations, not server restarts)
 const jobStatus = {};
 
 app.post("/api/calculate-contribution", async (req, res) => {
@@ -408,9 +408,24 @@ app.post("/api/calculate-contribution", async (req, res) => {
     });
   }
 
+  // Check if analysis is needed (only allow if sources config changed since last run)
+  const config = loadPortalConfig();
+  const portalConfig = config[String(portalId)] || {};
+  const lastAnalysisRun = portalConfig.lastAnalysisRun || null;
+  const lastSourcesUpdated = portalConfig.updatedAt || null;
+
+  // If analysis has been run and sources haven't changed since, block it
+  if (lastAnalysisRun && lastSourcesUpdated && new Date(lastAnalysisRun) > new Date(lastSourcesUpdated)) {
+    return res.json({
+      success: false,
+      status: "blocked",
+      message: "Analysis has already been run with the current source configuration. Change your marketing source settings to run again.",
+    });
+  }
+
   // Respond immediately — processing happens in the background
   jobStatus[portalId] = { running: true, processed: 0, updated: 0, failed: 0, skippedNoHistory: 0, startedAt: new Date().toISOString() };
-  res.json({ success: true, message: "Analysis started! Check status on the Status tab.", status: "started" });
+  res.json({ success: true, message: "Analysis started! Tracking progress...", status: "started" });
 
   // Background processing
   try {
@@ -465,6 +480,20 @@ app.post("/api/calculate-contribution", async (req, res) => {
     jobStatus[portalId].running = false;
     jobStatus[portalId].completedAt = new Date().toISOString();
     console.log(`Portal ${portalId}: Analysis complete!`, jobStatus[portalId]);
+
+    // Persist lastAnalysisRun to portal config
+    const updatedConfig = loadPortalConfig();
+    updatedConfig[String(portalId)] = {
+      ...(updatedConfig[String(portalId)] || {}),
+      lastAnalysisRun: jobStatus[portalId].completedAt,
+      lastAnalysisResult: {
+        processed: jobStatus[portalId].processed,
+        updated: jobStatus[portalId].updated,
+        skippedNoHistory: jobStatus[portalId].skippedNoHistory,
+        failed: jobStatus[portalId].failed,
+      },
+    };
+    savePortalConfig(updatedConfig);
   } catch (e) {
     console.error("Background calculation error:", e);
     jobStatus[portalId].running = false;
@@ -472,34 +501,93 @@ app.post("/api/calculate-contribution", async (req, res) => {
   }
 });
 
-// Status endpoint so the settings page can poll for progress
+// Status endpoint — returns job progress + portal config timestamps
 app.get("/api/calculate-contribution/status", async (req, res) => {
   const portalId = req.query.portalId;
   if (!portalId) {
     return res.status(400).json({ success: false, message: "Missing portalId" });
   }
 
-  const status = jobStatus[portalId];
-  if (!status) {
-    return res.json({ success: true, status: "idle", message: "No analysis has been run yet." });
+  const config = loadPortalConfig();
+  const portalConfig = config[String(portalId)] || {};
+  const lastAnalysisRun = portalConfig.lastAnalysisRun || null;
+  const lastSourcesUpdated = portalConfig.updatedAt || null;
+  const lastAnalysisResult = portalConfig.lastAnalysisResult || null;
+
+  // Determine if the Run Analysis button should be enabled
+  // Enabled if: no analysis has ever run, OR sources were updated after the last analysis
+  let analysisAllowed = true;
+  if (lastAnalysisRun && lastSourcesUpdated) {
+    analysisAllowed = new Date(lastSourcesUpdated) > new Date(lastAnalysisRun);
+  } else if (lastAnalysisRun && !lastSourcesUpdated) {
+    // Analysis has run but sources were never explicitly configured (used defaults)
+    analysisAllowed = false;
   }
 
-  const statusLabel = status.running ? "running" : (status.error ? "error" : "completed");
+  // Check in-memory job status
+  const job = jobStatus[portalId];
+
+  if (job?.running) {
+    return res.json({
+      success: true,
+      status: "running",
+      processed: job.processed,
+      updated: job.updated,
+      skippedNoHistory: job.skippedNoHistory,
+      failed: job.failed,
+      startedAt: job.startedAt,
+      message: `Processing... ${job.processed} contacts done so far.`,
+      lastAnalysisRun,
+      lastSourcesUpdated,
+      analysisAllowed: false, // Can't run while already running
+    });
+  }
+
+  if (job && !job.running) {
+    const statusLabel = job.error ? "error" : "completed";
+    return res.json({
+      success: true,
+      status: statusLabel,
+      processed: job.processed,
+      updated: job.updated,
+      skippedNoHistory: job.skippedNoHistory,
+      failed: job.failed,
+      startedAt: job.startedAt,
+      completedAt: job.completedAt || null,
+      error: job.error || null,
+      message: job.error
+        ? `Error: ${job.error}`
+        : `Complete! Processed ${job.processed} contacts. Updated: ${job.updated}, Zero-history: ${job.skippedNoHistory}, Failed: ${job.failed}.`,
+      lastAnalysisRun,
+      lastSourcesUpdated,
+      analysisAllowed,
+    });
+  }
+
+  // No in-memory job — check persisted data
+  if (lastAnalysisRun && lastAnalysisResult) {
+    return res.json({
+      success: true,
+      status: "completed",
+      processed: lastAnalysisResult.processed,
+      updated: lastAnalysisResult.updated,
+      skippedNoHistory: lastAnalysisResult.skippedNoHistory,
+      failed: lastAnalysisResult.failed,
+      completedAt: lastAnalysisRun,
+      message: `Last analysis completed on ${new Date(lastAnalysisRun).toLocaleString()}. Processed ${lastAnalysisResult.processed} contacts.`,
+      lastAnalysisRun,
+      lastSourcesUpdated,
+      analysisAllowed,
+    });
+  }
+
   return res.json({
     success: true,
-    status: statusLabel,
-    processed: status.processed,
-    updated: status.updated,
-    skippedNoHistory: status.skippedNoHistory,
-    failed: status.failed,
-    startedAt: status.startedAt,
-    completedAt: status.completedAt || null,
-    error: status.error || null,
-    message: status.running
-      ? `Processing... ${status.processed} contacts done so far.`
-      : status.error
-        ? `Error: ${status.error}`
-        : `Complete! Processed ${status.processed} contacts. Updated: ${status.updated}, Zero-history: ${status.skippedNoHistory}, Failed: ${status.failed}.`,
+    status: "idle",
+    message: "No analysis has been run yet.",
+    lastAnalysisRun: null,
+    lastSourcesUpdated,
+    analysisAllowed: true,
   });
 });
 

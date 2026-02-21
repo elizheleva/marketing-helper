@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from "react";
+import React, { useState, useEffect, useCallback, useRef } from "react";
 import {
   Button,
   Flex,
@@ -19,40 +19,179 @@ type AnyObj = Record<string, any>;
 type SourceOption = { value: string; label: string };
 
 const SettingsPage = ({ context }: AnyObj) => {
-  const [loading, setLoading] = useState(false);
-  const [message, setMessage] = useState("");
+  // --- Analysis state ---
+  const [analysisRunning, setAnalysisRunning] = useState(false);
+  const [analysisMessage, setAnalysisMessage] = useState("");
+  const [analysisAllowed, setAnalysisAllowed] = useState(true);
   const [statusInfo, setStatusInfo] = useState<AnyObj | null>(null);
+  const pollingRef = useRef(false);
 
-  // Source configuration state
+  // --- Source configuration state ---
   const [allSources, setAllSources] = useState<SourceOption[]>([]);
   const [selectedSources, setSelectedSources] = useState<string[]>([]);
   const [sourcesLoading, setSourcesLoading] = useState(true);
   const [sourcesMessage, setSourcesMessage] = useState("");
   const [sourcesSaving, setSourcesSaving] = useState(false);
 
-  /**
-   * Load the current marketing source configuration on mount.
-   */
+  // --- Log state ---
+  const [lastAnalysisRun, setLastAnalysisRun] = useState<string | null>(null);
+  const [lastSourcesUpdated, setLastSourcesUpdated] = useState<string | null>(
+    null
+  );
+
+  // ========================================
+  // On mount: load sources + check job status
+  // ========================================
   useEffect(() => {
-    const loadSources = async () => {
+    loadSources();
+    checkStatus();
+  }, []);
+
+  /**
+   * Load the marketing source configuration.
+   */
+  const loadSources = async () => {
+    try {
+      const resp = await hubspot.fetch(
+        `${BACKEND_URL}/api/marketing-sources`,
+        { method: "GET" }
+      );
+      const data = await resp.json();
+      if (data.success) {
+        setAllSources(data.allSources || []);
+        setSelectedSources(data.selectedSources || []);
+      }
+    } catch (e: any) {
+      console.error("Failed to load sources:", e);
+    } finally {
+      setSourcesLoading(false);
+    }
+  };
+
+  /**
+   * Check the current status of any running/completed analysis.
+   * If a job is running, starts polling automatically.
+   */
+  const checkStatus = async () => {
+    try {
+      const resp = await hubspot.fetch(
+        `${BACKEND_URL}/api/calculate-contribution/status`,
+        { method: "GET" }
+      );
+      const data = await resp.json();
+
+      setStatusInfo(data);
+      setLastAnalysisRun(data.lastAnalysisRun || null);
+      setLastSourcesUpdated(data.lastSourcesUpdated || null);
+      setAnalysisAllowed(data.analysisAllowed !== false);
+
+      if (data.status === "running") {
+        setAnalysisRunning(true);
+        setAnalysisMessage(data.message || "Processing...");
+        // Start polling if not already
+        if (!pollingRef.current) {
+          pollingRef.current = true;
+          startPolling();
+        }
+      } else if (data.status === "completed") {
+        setAnalysisRunning(false);
+        setAnalysisMessage(data.message || "");
+      } else if (data.status === "error") {
+        setAnalysisRunning(false);
+        setAnalysisMessage(`Error: ${data.error || "Unknown error"}`);
+      }
+    } catch (e: any) {
+      console.error("Failed to check status:", e);
+    }
+  };
+
+  /**
+   * Poll the status endpoint every 3 seconds while a job is running.
+   */
+  const startPolling = () => {
+    const poll = async () => {
       try {
         const resp = await hubspot.fetch(
-          `${BACKEND_URL}/api/marketing-sources`,
+          `${BACKEND_URL}/api/calculate-contribution/status`,
           { method: "GET" }
         );
         const data = await resp.json();
-        if (data.success) {
-          setAllSources(data.allSources || []);
-          setSelectedSources(data.selectedSources || []);
+
+        setStatusInfo(data);
+        setLastAnalysisRun(data.lastAnalysisRun || null);
+        setLastSourcesUpdated(data.lastSourcesUpdated || null);
+
+        if (data.status === "running") {
+          setAnalysisMessage(data.message || "Processing...");
+          setTimeout(poll, 3000);
+        } else {
+          // Job finished
+          pollingRef.current = false;
+          setAnalysisRunning(false);
+          setAnalysisAllowed(data.analysisAllowed !== false);
+          if (data.status === "completed") {
+            setAnalysisMessage(data.message || "Analysis complete!");
+          } else if (data.status === "error") {
+            setAnalysisMessage(`Error: ${data.error || "Unknown error"}`);
+          }
         }
       } catch (e: any) {
-        console.error("Failed to load sources:", e);
-      } finally {
-        setSourcesLoading(false);
+        pollingRef.current = false;
+        setAnalysisRunning(false);
+        setAnalysisMessage(
+          `Error checking status: ${e?.message || "Unknown error"}`
+        );
       }
     };
-    loadSources();
-  }, []);
+
+    setTimeout(poll, 3000);
+  };
+
+  /**
+   * Kick off the full analysis.
+   */
+  const runFullAnalysis = async () => {
+    setAnalysisRunning(true);
+    setAnalysisMessage("Starting analysis...");
+    setStatusInfo(null);
+
+    try {
+      const response = await hubspot.fetch(
+        `${BACKEND_URL}/api/calculate-contribution`,
+        { method: "POST", body: {} }
+      );
+
+      const result = await response.json();
+
+      if (!result.success) {
+        setAnalysisRunning(false);
+        setAnalysisMessage(result.message || "Failed to start analysis.");
+        return;
+      }
+
+      if (result.status === "blocked") {
+        setAnalysisRunning(false);
+        setAnalysisAllowed(false);
+        setAnalysisMessage(result.message);
+        return;
+      }
+
+      setAnalysisMessage(result.message || "Analysis started...");
+
+      // Start polling for progress
+      if (!pollingRef.current) {
+        pollingRef.current = true;
+        startPolling();
+      }
+    } catch (error: any) {
+      const detail =
+        error?.message ||
+        (typeof error === "string" ? error : "") ||
+        "Failed to start analysis";
+      setAnalysisMessage(`Error: ${detail}`);
+      setAnalysisRunning(false);
+    }
+  };
 
   /**
    * Toggle a source on/off.
@@ -76,14 +215,14 @@ const SettingsPage = ({ context }: AnyObj) => {
     try {
       const resp = await hubspot.fetch(
         `${BACKEND_URL}/api/marketing-sources`,
-        {
-          method: "POST",
-          body: { selectedSources },
-        }
+        { method: "POST", body: { selectedSources } }
       );
       const data = await resp.json();
       if (data.success) {
         setSourcesMessage(data.message);
+        // Sources changed — unlock the Run Analysis button
+        setAnalysisAllowed(true);
+        setLastSourcesUpdated(new Date().toISOString());
       } else {
         throw new Error(data.message || "Failed to save");
       }
@@ -95,82 +234,21 @@ const SettingsPage = ({ context }: AnyObj) => {
   };
 
   /**
-   * Poll the status endpoint until the job is complete.
+   * Format a timestamp for display.
    */
-  const pollStatus = useCallback(async () => {
-    const poll = async () => {
-      try {
-        const resp = await hubspot.fetch(
-          `${BACKEND_URL}/api/calculate-contribution/status`,
-          { method: "GET" }
-        );
-        const data = await resp.json();
-        setStatusInfo(data);
-
-        if (data.status === "running") {
-          setMessage(
-            `Processing... ${data.processed} contacts done so far.`
-          );
-          setTimeout(poll, 3000);
-        } else if (data.status === "completed") {
-          setMessage(
-            `Done! Processed ${data.processed} contacts. Updated: ${data.updated}, Zero-history: ${data.skippedNoHistory}, Failed: ${data.failed}.`
-          );
-          setLoading(false);
-        } else if (data.status === "error") {
-          setMessage(`Error: ${data.error}`);
-          setLoading(false);
-        } else {
-          setLoading(false);
-        }
-      } catch (e: any) {
-        setMessage(`Error checking status: ${e?.message || "Unknown error"}`);
-        setLoading(false);
-      }
-    };
-
-    await poll();
-  }, []);
-
-  /**
-   * Kick off the full analysis.
-   */
-  const runFullAnalysis = async () => {
-    setLoading(true);
-    setMessage("Starting analysis...");
-    setStatusInfo(null);
-
-    try {
-      const response = await hubspot.fetch(
-        `${BACKEND_URL}/api/calculate-contribution`,
-        {
-          method: "POST",
-          body: {},
-        }
-      );
-
-      const result = await response.json();
-
-      if (!result.success) {
-        throw new Error(result.message || "Failed to start analysis");
-      }
-
-      if (result.status === "running") {
-        setMessage(result.message);
-      } else {
-        setMessage("Analysis started! Tracking progress...");
-      }
-
-      setTimeout(() => pollStatus(), 2000);
-    } catch (error: any) {
-      const detail =
-        error?.message ||
-        (typeof error === "string" ? error : "") ||
-        "Failed to start analysis";
-      setMessage(`Error: ${detail}`);
-      setLoading(false);
-    }
+  const formatTimestamp = (ts: string | null): string => {
+    if (!ts) return "Never";
+    const d = new Date(ts);
+    return d.toLocaleString();
   };
+
+  // Determine button state
+  const buttonDisabled = analysisRunning || !analysisAllowed;
+  const buttonLabel = analysisRunning
+    ? "Processing..."
+    : !analysisAllowed
+      ? "Analysis up to date"
+      : "Run Full Analysis";
 
   return (
     <Flex direction="column" gap="large">
@@ -188,8 +266,9 @@ const SettingsPage = ({ context }: AnyObj) => {
               channels.
             </Text>
             <Text format={{ fontSize: "small" }}>
-              You can configure which traffic sources count as
-              &quot;marketing&quot; in the Configure Sources tab.
+              Use the tabs to: configure which sources count as
+              &quot;marketing&quot;, run the full database analysis, view
+              real-time update status, and check the activity log.
             </Text>
             <Text format={{ fontSize: "small", color: "subtle" }}>
               Powered by uspeh
@@ -250,52 +329,74 @@ const SettingsPage = ({ context }: AnyObj) => {
                 {sourcesMessage}
               </Text>
             )}
+
+            <Divider />
+
+            <Text format={{ fontSize: "small", color: "subtle" }}>
+              After saving, click &quot;Run Full Analysis&quot; on the Run
+              Analysis tab to recalculate all contacts with the new settings.
+              Future webhook updates will also use the new configuration.
+            </Text>
           </Flex>
         </Tab>
 
         <Tab tabId="actions" title="Run Analysis">
           <Flex direction="column" gap="large">
             <Text>
-              Click the button below to calculate Marketing Contribution
-              Percentage for your entire contact database. The system processes
-              all contacts in the background.
+              Run a full analysis across your entire contact database. The
+              system processes all contacts in the background — you can
+              navigate away and come back to check progress.
             </Text>
 
             <Text format={{ fontSize: "small" }}>
               This will:{"\n"}&bull; Create the &quot;Marketing Contribution
               Percentage&quot; property (if it doesn&apos;t exist){"\n"}&bull;
               Read each contact&apos;s full hs_latest_source property history
-              (including the initial value){"\n"}&bull; Calculate the % based on
-              your configured marketing sources{"\n"}&bull; Update each contact
-              with the calculated percentage{"\n"}&bull; Automatically continue
-              until all contacts are processed
+              {"\n"}&bull; Calculate the % based on your configured marketing
+              sources{"\n"}&bull; Update each contact with the calculated
+              percentage
             </Text>
 
-            <Button
-              onClick={runFullAnalysis}
-              disabled={loading}
-              variant="primary"
-            >
-              {loading ? "Processing..." : "Run Full Analysis"}
-            </Button>
-
-            {loading && statusInfo && statusInfo.status === "running" && (
-              <Flex direction="column" gap="small">
-                <Text format={{ fontSize: "small", color: "subtle" }}>
-                  {statusInfo.processed} contacts processed &middot;{" "}
-                  {statusInfo.updated} updated &middot; {statusInfo.failed}{" "}
-                  failed
+            {!analysisAllowed && !analysisRunning && (
+              <Flex direction="row" gap="small">
+                <Tag variant="default">Up to date</Tag>
+                <Text format={{ fontSize: "small" }}>
+                  Analysis has been run with the current source settings.
+                  Change your marketing source configuration to run again.
                 </Text>
               </Flex>
             )}
 
-            {message && (
+            <Button
+              onClick={runFullAnalysis}
+              disabled={buttonDisabled}
+              variant="primary"
+            >
+              {buttonLabel}
+            </Button>
+
+            {analysisRunning &&
+              statusInfo &&
+              statusInfo.status === "running" && (
+                <Flex direction="column" gap="small">
+                  <Tag variant="warning">Running</Tag>
+                  <Text format={{ fontSize: "small" }}>
+                    {statusInfo.processed} contacts processed &middot;{" "}
+                    {statusInfo.updated} updated &middot;{" "}
+                    {statusInfo.failed} failed
+                  </Text>
+                </Flex>
+              )}
+
+            {analysisMessage && (
               <Text
                 format={{
-                  color: message.startsWith("Error") ? "error" : "success",
+                  color: analysisMessage.startsWith("Error")
+                    ? "error"
+                    : "success",
                 }}
               >
-                {message}
+                {analysisMessage}
               </Text>
             )}
           </Flex>
@@ -311,11 +412,10 @@ const SettingsPage = ({ context }: AnyObj) => {
             </Flex>
 
             <Text>
-              The app is configured to listen for changes to the
-              hs_latest_source property on contacts. When a contact&apos;s
-              traffic source changes, the Marketing Contribution Percentage is
-              automatically recalculated using your configured marketing
-              sources.
+              The app listens for changes to the hs_latest_source property on
+              contacts. When a contact&apos;s traffic source changes, the
+              Marketing Contribution Percentage is automatically recalculated
+              using your current marketing source configuration.
             </Text>
 
             <Divider />
@@ -323,9 +423,9 @@ const SettingsPage = ({ context }: AnyObj) => {
             <Text format={{ fontWeight: "bold" }}>How it works:</Text>
             <Text format={{ fontSize: "small" }}>
               1. HubSpot detects a change to hs_latest_source on a contact
-              {"\n"}2. A webhook event is sent to your server{"\n"}3. The server
+              {"\n"}2. A webhook event is sent to the server{"\n"}3. The server
               fetches the contact&apos;s full source history{"\n"}4. It
-              recalculates the marketing contribution percentage{"\n"}5. The
+              recalculates using your configured marketing sources{"\n"}5. The
               contact&apos;s property is updated automatically
             </Text>
 
@@ -333,8 +433,88 @@ const SettingsPage = ({ context }: AnyObj) => {
 
             <Text format={{ fontSize: "small", color: "subtle" }}>
               Tip: Configure your marketing sources first, then run the Full
-              Analysis to set initial values. The webhook keeps everything up to
-              date going forward.
+              Analysis to set initial values. The webhook keeps everything up
+              to date going forward.
+            </Text>
+          </Flex>
+        </Tab>
+
+        <Tab tabId="log" title="Activity Log">
+          <Flex direction="column" gap="large">
+            <Text format={{ fontWeight: "bold" }}>Activity Log</Text>
+
+            <Flex direction="column" gap="medium">
+              <Flex direction="column" gap="extra-small">
+                <Text format={{ fontWeight: "bold", fontSize: "small" }}>
+                  Last source configuration change
+                </Text>
+                <Text>
+                  {lastSourcesUpdated
+                    ? formatTimestamp(lastSourcesUpdated)
+                    : "Never (using default sources)"}
+                </Text>
+              </Flex>
+
+              <Divider />
+
+              <Flex direction="column" gap="extra-small">
+                <Text format={{ fontWeight: "bold", fontSize: "small" }}>
+                  Last full analysis run
+                </Text>
+                <Text>
+                  {lastAnalysisRun
+                    ? formatTimestamp(lastAnalysisRun)
+                    : "Never"}
+                </Text>
+                {statusInfo &&
+                  (statusInfo.status === "completed" ||
+                    statusInfo.lastAnalysisRun) && (
+                    <Text format={{ fontSize: "small", color: "subtle" }}>
+                      Processed: {statusInfo.processed || 0} &middot; Updated:{" "}
+                      {statusInfo.updated || 0} &middot; Zero-history:{" "}
+                      {statusInfo.skippedNoHistory || 0} &middot; Failed:{" "}
+                      {statusInfo.failed || 0}
+                    </Text>
+                  )}
+              </Flex>
+
+              <Divider />
+
+              <Flex direction="column" gap="extra-small">
+                <Text format={{ fontWeight: "bold", fontSize: "small" }}>
+                  Current status
+                </Text>
+                {analysisRunning ? (
+                  <Flex direction="row" gap="small">
+                    <Tag variant="warning">Running</Tag>
+                    <Text>
+                      {statusInfo?.processed || 0} contacts processed
+                    </Text>
+                  </Flex>
+                ) : analysisAllowed ? (
+                  <Flex direction="row" gap="small">
+                    <Tag variant="default">Pending</Tag>
+                    <Text>
+                      Source configuration has changed — analysis available
+                    </Text>
+                  </Flex>
+                ) : (
+                  <Flex direction="row" gap="small">
+                    <Tag variant="success">Up to date</Tag>
+                    <Text>
+                      Analysis matches current source configuration
+                    </Text>
+                  </Flex>
+                )}
+              </Flex>
+            </Flex>
+
+            <Divider />
+
+            <Text format={{ fontSize: "small", color: "subtle" }}>
+              Note: Changing the marketing source configuration may impact
+              reporting. The timestamp above records when the configuration
+              was last modified so you can track any reporting changes.
             </Text>
           </Flex>
         </Tab>

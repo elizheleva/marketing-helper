@@ -1,5 +1,5 @@
 {
-  "uid": "Eliaudittest_settings",
+  "uid": "marketing_helper_settings",
   "type": "settings",
   "config": {
     "entrypoint": "/app/settings/SettingsPage.tsx"

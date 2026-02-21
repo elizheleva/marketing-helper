@@ -118,7 +118,7 @@ const SettingsPage = ({ context }: AnyObj) => {
   return (
     <Flex direction="column" gap="large">
       <Text format={{ fontWeight: "bold", fontSize: "xlarge" }}>
-        Marketing Contribution Settings
+        Marketing Helper Settings
       </Text>
 
       <Tabs defaultSelected="actions">

@@ -1,9 +1,9 @@
   {
-  "uid": "Elisaudittest_app",
+  "uid": "marketing_helper_app",
   "type": "app",
   "config": {
     "description": "An example to demonstrate how to build a static private app with developer projects.",
-    "name": "Marketing contribution",
+    "name": "Marketing helper",
     "distribution": "private",
     "auth": {
       "type": "oauth",

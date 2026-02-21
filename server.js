@@ -35,7 +35,7 @@ function escapeHtml(str) {
     .replaceAll(">", "&gt;");
 }
 
-const TOKEN_STORE_PATH = "./hubspot-tokens.json";
+const TOKEN_STORE_PATH = process.env.TOKEN_STORE_PATH || "./data/hubspot-tokens.json";
 
 function loadTokenStore() {
   try {

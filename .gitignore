@@ -1,0 +1,34 @@
+# Dependencies
+node_modules/
+src/app/settings/node_modules/
+
+# Sensitive files - NEVER commit these
+hubspot-tokens.json
+.env
+*.env
+.env.*
+
+# HubSpot config (contains auth tokens)
+hubspot.config.yml
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs
+*.log
+npm-debug.log*
+
+# Legacy reference project (has its own .git)
+oauth-quickstart-nodejs/
+
+# Build output
+dist/
+build/

@@ -1,0 +1,19 @@
+{
+  "uid": "Eliaudittest_webhooks",
+  "type": "webhooks",
+  "config": {
+    "settings": {
+      "targetUrl": "https://api.uspeh.co.uk/webhook/hs-latest-source",
+      "maxConcurrentRequests": 5
+    },
+    "subscriptions": {
+      "legacyCrmObjects": [
+        {
+          "subscriptionType": "contact.propertyChange",
+          "propertyName": "hs_latest_source",
+          "active": true
+        }
+      ]
+    }
+  }
+}

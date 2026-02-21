@@ -1,0 +1,16 @@
+node_modules
+npm-debug.log
+.env
+.env.local
+.env.*.local
+hubspot-tokens.json
+.git
+.gitignore
+README.md
+*.md
+.vscode
+.idea
+oauth-quickstart-nodejs
+src
+hsproject.json
+*.hsmeta.json

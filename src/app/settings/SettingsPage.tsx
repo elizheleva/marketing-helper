@@ -1,4 +1,4 @@
-import React, { useState } from "react";
+import React, { useState, useCallback } from "react";
 import {
   Button,
   Flex,
@@ -13,104 +13,91 @@ import { hubspot } from "@hubspot/ui-extensions";
 hubspot.extend<"settings">(({ context }) => <SettingsPage context={context} />);
 
 const BACKEND_URL = "https://api.uspeh.co.uk";
-const BATCH_LIMIT = 300;
 
 type AnyObj = Record<string, any>;
 
 const SettingsPage = ({ context }: AnyObj) => {
   const [loading, setLoading] = useState(false);
   const [message, setMessage] = useState("");
-  const [batchProgress, setBatchProgress] = useState({
-    totalProcessed: 0,
-    totalUpdated: 0,
-    totalSkipped: 0,
-    totalFailed: 0,
-    batchNumber: 0,
-    done: false,
-  });
+  const [statusInfo, setStatusInfo] = useState<AnyObj | null>(null);
 
   /**
-   * Run the full analysis across the entire database.
-   * Automatically paginates through all contacts in batches.
+   * Poll the status endpoint until the job is complete.
+   */
+  const pollStatus = useCallback(async () => {
+    const poll = async () => {
+      try {
+        const resp = await hubspot.fetch(
+          `${BACKEND_URL}/api/calculate-contribution/status`,
+          { method: "GET" }
+        );
+        const data = await resp.json();
+        setStatusInfo(data);
+
+        if (data.status === "running") {
+          setMessage(
+            `Processing... ${data.processed} contacts done so far.`
+          );
+          // Poll again after 3 seconds
+          setTimeout(poll, 3000);
+        } else if (data.status === "completed") {
+          setMessage(
+            `Done! Processed ${data.processed} contacts. Updated: ${data.updated}, Zero-history: ${data.skippedNoHistory}, Failed: ${data.failed}.`
+          );
+          setLoading(false);
+        } else if (data.status === "error") {
+          setMessage(`Error: ${data.error}`);
+          setLoading(false);
+        } else {
+          setLoading(false);
+        }
+      } catch (e: any) {
+        setMessage(`Error checking status: ${e?.message || "Unknown error"}`);
+        setLoading(false);
+      }
+    };
+
+    await poll();
+  }, []);
+
+  /**
+   * Kick off the full analysis — responds instantly, then we poll for progress.
    */
   const runFullAnalysis = async () => {
     setLoading(true);
     setMessage("Starting analysis...");
-    setBatchProgress({
-      totalProcessed: 0,
-      totalUpdated: 0,
-      totalSkipped: 0,
-      totalFailed: 0,
-      batchNumber: 0,
-      done: false,
-    });
-
-    let afterCursor: string | null = null;
-    let totalProcessed = 0;
-    let totalUpdated = 0;
-    let totalSkipped = 0;
-    let totalFailed = 0;
-    let batchNumber = 0;
-    let propertyCreated = false;
+    setStatusInfo(null);
 
     try {
-      // Keep calling until there are no more contacts
-      do {
-        batchNumber++;
-        setMessage(
-          `Processing batch ${batchNumber} (${totalProcessed} contacts so far)...`
-        );
-
-        const response = await hubspot.fetch(
-          `${BACKEND_URL}/api/calculate-contribution`,
-          {
-            method: "POST",
-            body: { after: afterCursor },
-          }
-        );
-
-        const result = await response.json();
-
-        if (!result.success) {
-          throw new Error(result.message || "Batch processing failed");
+      const response = await hubspot.fetch(
+        `${BACKEND_URL}/api/calculate-contribution`,
+        {
+          method: "POST",
+          body: {},
         }
-
-        totalProcessed += result.processed || 0;
-        totalUpdated += result.updated || 0;
-        totalSkipped += result.skippedNoHistory || 0;
-        totalFailed += result.failed || 0;
-        if (result.propertyCreated) propertyCreated = true;
-
-        afterCursor = result.nextAfter || null;
-
-        setBatchProgress({
-          totalProcessed,
-          totalUpdated,
-          totalSkipped,
-          totalFailed,
-          batchNumber,
-          done: !afterCursor,
-        });
-      } while (afterCursor);
-
-      // All done
-      const parts: string[] = [];
-      if (propertyCreated) parts.push("Created property.");
-      parts.push(
-        `Processed ${totalProcessed} contacts across ${batchNumber} batch(es).`
       );
-      parts.push(`Updated: ${totalUpdated}.`);
-      parts.push(`Zero-history: ${totalSkipped}.`);
-      if (totalFailed > 0) parts.push(`Failed: ${totalFailed}.`);
 
-      setMessage(`Done! ${parts.join(" ")}`);
+      const result = await response.json();
+
+      if (!result.success) {
+        throw new Error(result.message || "Failed to start analysis");
+      }
+
+      if (result.status === "running") {
+        // Already running from a previous click
+        setMessage(result.message);
+      } else {
+        setMessage("Analysis started! Tracking progress...");
+      }
+
+      // Start polling for status
+      setTimeout(() => pollStatus(), 2000);
     } catch (error: any) {
       const detail =
         error?.message ||
         (typeof error === "string" ? error : "") ||
-        "Failed to run analysis";
+        "Failed to start analysis";
       setMessage(`Error: ${detail}`);
-    } finally {
       setLoading(false);
     }
   };
@@ -142,8 +129,8 @@ const SettingsPage = ({ context }: AnyObj) => {
             <Text>
               Click the button below to calculate Marketing Contribution
               Percentage for your entire contact database. The system
-              automatically paginates through all contacts in batches of{" "}
-              {BATCH_LIMIT}.
+              processes all contacts in the background — you can check
+              progress below.
             </Text>
 
             <Text format={{ fontSize: "small" }}>
@@ -164,12 +151,12 @@ const SettingsPage = ({ context }: AnyObj) => {
               {loading ? "Processing..." : "Run Full Analysis"}
             </Button>
 
-            {loading && batchProgress.batchNumber > 0 && (
+            {loading && statusInfo && statusInfo.status === "running" && (
               <Flex direction="column" gap="small">
                 <Text format={{ fontSize: "small", color: "subtle" }}>
-                  Batch {batchProgress.batchNumber} &middot;{" "}
-                  {batchProgress.totalProcessed} contacts processed &middot;{" "}
-                  {batchProgress.totalUpdated} updated
+                  {statusInfo.processed} contacts processed &middot;{" "}
+                  {statusInfo.updated} updated &middot;{" "}
+                  {statusInfo.failed} failed
                 </Text>
               </Flex>
             )}

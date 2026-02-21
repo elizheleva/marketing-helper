@@ -167,7 +167,7 @@ function computeMarketingContribution(historyEntries) {
     if (MARKETING_SOURCES.has(newValue)) marketingChanges++;
   }
 
-  const percent = totalChanges > 0 ? (marketingChanges / totalChanges) * 100 : 0;
+  const percent = totalChanges > 0 ? marketingChanges / totalChanges : 0;
   return { percent, totalChanges, marketingChanges };
 }
 
@@ -340,92 +340,118 @@ app.get("/refresh", async (req, res) => {
 // Called from the settings page via hubspot.fetch()
 // HubSpot adds ?portalId=xxx&userId=xxx&userEmail=xxx&appId=xxx
 // ================================================================
+// In-memory job status tracker
+const jobStatus = {};
+
 app.post("/api/calculate-contribution", async (req, res) => {
-  try {
-    const portalId = req.query.portalId;
-    if (!portalId) {
-      return res.status(400).json({ success: false, message: "Missing portalId" });
-    }
+  const portalId = req.query.portalId;
+  if (!portalId) {
+    return res.status(400).json({ success: false, message: "Missing portalId" });
+  }
 
-    const afterCursor = req.body?.after || undefined;
-
-    // Ensure custom property exists (only on first batch)
-    let propertyCreated = false;
-    if (!afterCursor) {
-      propertyCreated = await ensurePropertyExists(portalId);
-    }
-
-    // Fetch contacts (one page of up to BATCH_LIMIT)
-    const contactIds = [];
-    let after = afterCursor;
-    let nextAfter = null;
-
-    while (contactIds.length < BATCH_LIMIT) {
-      const remaining = BATCH_LIMIT - contactIds.length;
-      const pageLimit = Math.min(PAGE_SIZE, remaining);
-
-      let url = `https://api.hubapi.com/crm/v3/objects/contacts?limit=${pageLimit}`;
-      if (after) url += `&after=${encodeURIComponent(after)}`;
-
-      const data = await hubspotApi(portalId, url, { method: "GET" });
-      const results = Array.isArray(data?.results) ? data.results : [];
-
-      for (const r of results) {
-        if (r?.id) contactIds.push(String(r.id));
-        if (contactIds.length >= BATCH_LIMIT) break;
-      }
-
-      after = data?.paging?.next?.after;
-      if (!after || results.length === 0) break;
-    }
-
-    // If there are more contacts after this batch, save the cursor
-    if (after && contactIds.length >= BATCH_LIMIT) {
-      nextAfter = after;
-    }
-
-    // Process each contact
-    let updated = 0;
-    let skippedNoHistory = 0;
-    let failed = 0;
-
-    for (const contactId of contactIds) {
-      try {
-        const result = await processContact(portalId, contactId);
-        if (result.totalChanges === 0) {
-          skippedNoHistory++;
-        } else {
-          updated++;
-        }
-      } catch (e) {
-        console.error(`Failed contact ${contactId}:`, e.message);
-        failed++;
-      }
-    }
-
-    const messageParts = [];
-    if (propertyCreated) messageParts.push("Created property.");
-    messageParts.push(`Processed ${contactIds.length} contacts in this batch.`);
-    messageParts.push(`Updated: ${updated}.`);
-    messageParts.push(`Zero-history: ${skippedNoHistory}.`);
-    if (failed > 0) messageParts.push(`Failed: ${failed}.`);
-    if (nextAfter) messageParts.push("More contacts remaining...");
-    else messageParts.push("All contacts processed!");
-
+  // If a job is already running for this portal, don't start another
+  if (jobStatus[portalId]?.running) {
     return res.json({
       success: true,
-      message: messageParts.join(" "),
-      processed: contactIds.length,
-      updated,
-      skippedNoHistory,
-      failed,
-      nextAfter, // null if done, string cursor if more to process
-      propertyCreated,
+      message: `Analysis already in progress. ${jobStatus[portalId].processed} contacts processed so far...`,
+      status: "running",
+      ...jobStatus[portalId],
     });
-  } catch (e) {
-    console.error("calculate-contribution error:", e);
-    return res.status(500).json({ success: false, message: e.message });
   }
+
+  // Respond immediately — processing happens in the background
+  jobStatus[portalId] = { running: true, processed: 0, updated: 0, failed: 0, skippedNoHistory: 0, startedAt: new Date().toISOString() };
+  res.json({ success: true, message: "Analysis started! Check status on the Status tab.", status: "started" });
+
+  // Background processing
+  try {
+    await ensurePropertyExists(portalId);
+
+    let after = undefined;
+
+    while (true) {
+      // Fetch a batch of contacts
+      const contactIds = [];
+      let batchPages = 0;
+
+      while (contactIds.length < BATCH_LIMIT && batchPages < 3) {
+        let url = `https://api.hubapi.com/crm/v3/objects/contacts?limit=${PAGE_SIZE}`;
+        if (after) url += `&after=${encodeURIComponent(after)}`;
+
+        const data = await hubspotApi(portalId, url, { method: "GET" });
+        const results = Array.isArray(data?.results) ? data.results : [];
+
+        for (const r of results) {
+          if (r?.id) contactIds.push(String(r.id));
+        }
+
+        after = data?.paging?.next?.after;
+        batchPages++;
+        if (!after || results.length === 0) break;
+      }
+
+      if (contactIds.length === 0) break;
+
+      // Process each contact in this batch
+      for (const contactId of contactIds) {
+        try {
+          const result = await processContact(portalId, contactId);
+          if (result.totalChanges === 0) {
+            jobStatus[portalId].skippedNoHistory++;
+          } else {
+            jobStatus[portalId].updated++;
+          }
+        } catch (e) {
+          console.error(`Failed contact ${contactId}:`, e.message);
+          jobStatus[portalId].failed++;
+        }
+        jobStatus[portalId].processed++;
+      }
+
+      console.log(`Portal ${portalId}: processed ${jobStatus[portalId].processed} contacts so far...`);
+
+      if (!after) break; // No more contacts
+    }
+
+    jobStatus[portalId].running = false;
+    jobStatus[portalId].completedAt = new Date().toISOString();
+    console.log(`Portal ${portalId}: Analysis complete!`, jobStatus[portalId]);
+  } catch (e) {
+    console.error("Background calculation error:", e);
+    jobStatus[portalId].running = false;
+    jobStatus[portalId].error = e.message;
+  }
+});
+
+// Status endpoint so the settings page can poll for progress
+app.get("/api/calculate-contribution/status", async (req, res) => {
+  const portalId = req.query.portalId;
+  if (!portalId) {
+    return res.status(400).json({ success: false, message: "Missing portalId" });
+  }
+
+  const status = jobStatus[portalId];
+  if (!status) {
+    return res.json({ success: true, status: "idle", message: "No analysis has been run yet." });
+  }
+
+  const statusLabel = status.running ? "running" : (status.error ? "error" : "completed");
+  return res.json({
+    success: true,
+    status: statusLabel,
+    processed: status.processed,
+    updated: status.updated,
+    skippedNoHistory: status.skippedNoHistory,
+    failed: status.failed,
+    startedAt: status.startedAt,
+    completedAt: status.completedAt || null,
+    error: status.error || null,
+    message: status.running
+      ? `Processing... ${status.processed} contacts done so far.`
+      : status.error
+        ? `Error: ${status.error}`
+        : `Complete! Processed ${status.processed} contacts. Updated: ${status.updated}, Zero-history: ${status.skippedNoHistory}, Failed: ${status.failed}.`,
+  });
 });
 
 // ================================================================

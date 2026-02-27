@@ -16,6 +16,31 @@ const SOURCE_PROPERTY = "hs_latest_source";
 const PAGE_SIZE = 100;
 const BATCH_LIMIT = 300; // contacts per batch call
 
+// ---- MCF (Multi-Channel Funnel) Constants ----
+const MCF_RESULTS_PATH = process.env.MCF_RESULTS_PATH || "./data/mcf-results.json";
+const MCF_LOOKBACK_DAYS = 90;
+
+const CHANNEL_LABELS = {
+  ORGANIC_SEARCH: "Organic Search",
+  PAID_SEARCH: "Paid Search",
+  EMAIL_MARKETING: "Email Marketing",
+  SOCIAL_MEDIA: "Social Media",
+  REFERRALS: "Referrals",
+  OTHER_CAMPAIGNS: "Other Campaigns",
+  PAID_SOCIAL: "Paid Social",
+  DISPLAY_ADS: "Display Ads",
+  DIRECT_TRAFFIC: "Direct Traffic",
+  OFFLINE: "Offline",
+  OTHER: "Other",
+};
+
+const CONVERSION_TYPE_OPTIONS = [
+  { value: "form_submission", label: "Form Submission (first-ever)" },
+  { value: "meeting_booked", label: "Meeting Booked (first-ever)" },
+  { value: "deal_created", label: "Deal Created (first-ever)" },
+  { value: "closed_won", label: "Closed-Won Deal (first-ever)" },
+];
+
 // All possible hs_latest_source values in HubSpot
 const ALL_SOURCES = [
   { value: "ORGANIC_SEARCH", label: "Organic Search" },
@@ -215,6 +240,292 @@ function computeMarketingContribution(historyEntries, marketingSources) {
 
   const percent = totalChanges > 0 ? marketingChanges / totalChanges : 0;
   return { percent, totalChanges, marketingChanges };
+}
+
+// ================================================================
+// MCF HELPERS
+// ================================================================
+
+function loadMcfResults() {
+  try {
+    if (!fs.existsSync(MCF_RESULTS_PATH)) return {};
+    return JSON.parse(fs.readFileSync(MCF_RESULTS_PATH, "utf8"));
+  } catch {
+    return {};
+  }
+}
+
+function saveMcfResults(data) {
+  fs.writeFileSync(MCF_RESULTS_PATH, JSON.stringify(data, null, 2), "utf8");
+}
+
+/** Rate-limited HubSpot API call with exponential backoff retries. */
+async function hubspotApiWithRetry(portalId, url, options = {}, maxRetries = 3) {
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      return await hubspotApi(portalId, url, options);
+    } catch (e) {
+      if (e.status === 429 && attempt < maxRetries) {
+        const wait = Math.pow(2, attempt + 1) * 1000;
+        console.log(`Rate limited (${url}), retrying in ${wait}ms...`);
+        await new Promise((r) => setTimeout(r, wait));
+        continue;
+      }
+      throw e;
+    }
+  }
+}
+
+function msDelay(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+// Pipeline cache — maps portalId → { stageIds: Set, fetchedAt: number }
+const pipelineCache = {};
+
+/** Get all closed-won deal stage IDs for a portal (cached 1 hour). */
+async function getClosedWonStageIds(portalId) {
+  const key = String(portalId);
+  if (pipelineCache[key] && Date.now() - pipelineCache[key].fetchedAt < 3600000) {
+    return pipelineCache[key].stageIds;
+  }
+  try {
+    const data = await hubspotApiWithRetry(
+      portalId,
+      "https://api.hubapi.com/crm/v3/pipelines/deals"
+    );
+    const stageIds = new Set();
+    for (const pipeline of data.results || []) {
+      for (const stage of pipeline.stages || []) {
+        const meta = stage.metadata || {};
+        if (
+          meta.isClosed === "true" &&
+          parseFloat(meta.probability || "0") >= 1.0
+        ) {
+          stageIds.add(stage.id);
+        }
+      }
+    }
+    pipelineCache[key] = { stageIds, fetchedAt: Date.now() };
+    return stageIds;
+  } catch (e) {
+    console.error(`Failed to fetch pipelines for portal ${portalId}:`, e.message);
+    return new Set();
+  }
+}
+
+/**
+ * Determine the first-ever conversion timestamp for a contact.
+ * Returns { timestamp, value, currency, approximate? } or null.
+ */
+async function getConversionTimestamp(portalId, contactId, conversionType, contactProps) {
+  switch (conversionType) {
+    // ---- Form Submission ----
+    case "form_submission": {
+      const dateStr = contactProps?.hs_first_conversion_date;
+      if (!dateStr) return null;
+      const ts = new Date(dateStr).getTime();
+      if (isNaN(ts)) return null;
+      return { timestamp: ts, value: 0, currency: null };
+    }
+
+    // ---- Meeting Booked ----
+    case "meeting_booked": {
+      try {
+        const assocData = await hubspotApiWithRetry(
+          portalId,
+          `https://api.hubapi.com/crm/v3/objects/contacts/${contactId}/associations/meetings?limit=500`
+        );
+        const meetingIds = (assocData.results || []).map((r) =>
+          String(r.toObjectId || r.id)
+        );
+        if (meetingIds.length === 0) return null;
+
+        let earliestTs = Infinity;
+        for (let i = 0; i < meetingIds.length; i++) {
+          try {
+            const meeting = await hubspotApiWithRetry(
+              portalId,
+              `https://api.hubapi.com/crm/v3/objects/meetings/${meetingIds[i]}?properties=hs_meeting_start_time,hs_timestamp`
+            );
+            const raw =
+              meeting.properties?.hs_meeting_start_time ||
+              meeting.properties?.hs_timestamp ||
+              meeting.createdAt;
+            const ts = new Date(raw).getTime();
+            if (!isNaN(ts) && ts < earliestTs) earliestTs = ts;
+          } catch (e) {
+            console.warn(`MCF: skip meeting ${meetingIds[i]}:`, e.message);
+          }
+          if ((i + 1) % 5 === 0) await msDelay(100);
+        }
+        return earliestTs < Infinity
+          ? { timestamp: earliestTs, value: 0, currency: null }
+          : null;
+      } catch (e) {
+        console.warn(`MCF: meetings assoc error contact ${contactId}:`, e.message);
+        return null;
+      }
+    }
+
+    // ---- Deal Created ----
+    case "deal_created": {
+      try {
+        const assocData = await hubspotApiWithRetry(
+          portalId,
+          `https://api.hubapi.com/crm/v3/objects/contacts/${contactId}/associations/deals?limit=500`
+        );
+        const dealIds = (assocData.results || []).map((r) =>
+          String(r.toObjectId || r.id)
+        );
+        if (dealIds.length === 0) return null;
+
+        let earliest = { timestamp: Infinity, value: 0, currency: null };
+        for (let i = 0; i < dealIds.length; i++) {
+          try {
+            const deal = await hubspotApiWithRetry(
+              portalId,
+              `https://api.hubapi.com/crm/v3/objects/deals/${dealIds[i]}?properties=amount,deal_currency_code,createdate`
+            );
+            const ts = new Date(
+              deal.createdAt || deal.properties?.createdate
+            ).getTime();
+            if (!isNaN(ts) && ts < earliest.timestamp) {
+              earliest = {
+                timestamp: ts,
+                value: parseFloat(deal.properties?.amount || "0") || 0,
+                currency: deal.properties?.deal_currency_code || null,
+              };
+            }
+          } catch (e) {
+            console.warn(`MCF: skip deal ${dealIds[i]}:`, e.message);
+          }
+          if ((i + 1) % 5 === 0) await msDelay(100);
+        }
+        return earliest.timestamp < Infinity ? earliest : null;
+      } catch (e) {
+        console.warn(`MCF: deals assoc error contact ${contactId}:`, e.message);
+        return null;
+      }
+    }
+
+    // ---- Closed-Won Deal ----
+    case "closed_won": {
+      try {
+        const closedWonStages = await getClosedWonStageIds(portalId);
+        if (closedWonStages.size === 0) {
+          console.warn(`MCF: no closed-won stages found for portal ${portalId}`);
+          return null;
+        }
+
+        const assocData = await hubspotApiWithRetry(
+          portalId,
+          `https://api.hubapi.com/crm/v3/objects/contacts/${contactId}/associations/deals?limit=500`
+        );
+        const dealIds = (assocData.results || []).map((r) =>
+          String(r.toObjectId || r.id)
+        );
+        if (dealIds.length === 0) return null;
+
+        let earliest = {
+          timestamp: Infinity,
+          value: 0,
+          currency: null,
+          approximate: false,
+        };
+
+        for (let i = 0; i < dealIds.length; i++) {
+          try {
+            const deal = await hubspotApiWithRetry(
+              portalId,
+              `https://api.hubapi.com/crm/v3/objects/deals/${dealIds[i]}?properties=amount,deal_currency_code,closedate,dealstage&propertiesWithHistory=dealstage`
+            );
+
+            const currentStage = deal.properties?.dealstage;
+            if (!closedWonStages.has(currentStage)) continue;
+
+            // Find earliest timestamp when dealstage first became closed-won
+            const stageHistory = deal.propertiesWithHistory?.dealstage || [];
+            let closedWonTs = null;
+            let approximate = false;
+
+            const sorted = [...stageHistory].sort(
+              (a, b) => Number(a.timestamp || 0) - Number(b.timestamp || 0)
+            );
+            for (const entry of sorted) {
+              if (closedWonStages.has(entry.value)) {
+                closedWonTs = Number(entry.timestamp);
+                break;
+              }
+            }
+
+            // Fallback: use closedate (less accurate)
+            if (!closedWonTs && deal.properties?.closedate) {
+              closedWonTs = new Date(deal.properties.closedate).getTime();
+              approximate = true;
+            }
+
+            if (closedWonTs && !isNaN(closedWonTs) && closedWonTs < earliest.timestamp) {
+              earliest = {
+                timestamp: closedWonTs,
+                value: parseFloat(deal.properties?.amount || "0") || 0,
+                currency: deal.properties?.deal_currency_code || null,
+                approximate,
+              };
+            }
+          } catch (e) {
+            console.warn(`MCF: skip deal ${dealIds[i]} (closed-won):`, e.message);
+          }
+          if ((i + 1) % 5 === 0) await msDelay(100);
+        }
+        return earliest.timestamp < Infinity ? earliest : null;
+      } catch (e) {
+        console.warn(`MCF: closed-won assoc error contact ${contactId}:`, e.message);
+        return null;
+      }
+    }
+
+    default:
+      return null;
+  }
+}
+
+/**
+ * Build a conversion path from hs_latest_source history.
+ * Only includes entries within [conversionTime - lookbackDays, conversionTime].
+ * Collapses consecutive duplicate sources.
+ */
+function buildConversionPath(sourceHistory, conversionTimestamp, lookbackDays) {
+  const lookbackMs = (lookbackDays || MCF_LOOKBACK_DAYS) * 24 * 60 * 60 * 1000;
+  const windowStart = conversionTimestamp - lookbackMs;
+
+  const entries = (sourceHistory || [])
+    .filter((e) => {
+      const ts = Number(e.timestamp || 0);
+      return ts >= windowStart && ts <= conversionTimestamp;
+    })
+    .sort((a, b) => Number(a.timestamp || 0) - Number(b.timestamp || 0));
+
+  if (entries.length === 0) return ["UNKNOWN"];
+
+  const rawPath = entries
+    .map((e) => String(e.value || "").trim().toUpperCase())
+    .filter(Boolean);
+
+  // Collapse consecutive duplicates
+  const collapsed = [];
+  for (const step of rawPath) {
+    if (collapsed.length === 0 || collapsed[collapsed.length - 1] !== step) {
+      collapsed.push(step);
+    }
+  }
+
+  return collapsed.length > 0 ? collapsed : ["UNKNOWN"];
+}
+
+/** Create a stable string key for a path array. */
+function pathToKey(pathArray) {
+  return pathArray.join(">");
 }
 
 /**
@@ -643,6 +954,282 @@ app.post("/api/marketing-sources", async (req, res) => {
     message: `Saved ${selectedSources.length} marketing sources. Run analysis again to recalculate with the new settings.`,
     selectedSources,
   });
+});
+
+// ================================================================
+// MCF (MULTI-CHANNEL FUNNEL) PATHS ENDPOINTS
+// Replicates UA "Top Conversion Paths" behaviour.
+// ================================================================
+const mcfJobStatus = {};
+
+/** POST /api/mcf/refresh — start a background MCF analysis job. */
+app.post("/api/mcf/refresh", async (req, res) => {
+  const portalId = req.query.portalId;
+  if (!portalId) {
+    return res.status(400).json({ success: false, message: "Missing portalId" });
+  }
+
+  const {
+    conversionType = "form_submission",
+    startDate,
+    endDate,
+    thresholdPct = 10,
+  } = req.body || {};
+
+  const validTypes = ["form_submission", "meeting_booked", "deal_created", "closed_won"];
+  if (!validTypes.includes(conversionType)) {
+    return res
+      .status(400)
+      .json({ success: false, message: `Invalid conversionType: ${conversionType}` });
+  }
+
+  const now = new Date();
+  const end = endDate ? new Date(endDate) : now;
+  const start = startDate
+    ? new Date(startDate)
+    : new Date(end.getTime() - 90 * 24 * 60 * 60 * 1000);
+
+  const jobKey = String(portalId);
+
+  // Prevent duplicate concurrent jobs
+  if (mcfJobStatus[jobKey]?.running) {
+    return res.json({
+      success: true,
+      status: "running",
+      message: `MCF analysis already running. ${mcfJobStatus[jobKey].processed} contacts scanned so far.`,
+      ...mcfJobStatus[jobKey],
+    });
+  }
+
+  // Respond immediately — processing runs in background
+  mcfJobStatus[jobKey] = {
+    running: true,
+    processed: 0,
+    converting: 0,
+    startedAt: new Date().toISOString(),
+    conversionType,
+    startDate: start.toISOString(),
+    endDate: end.toISOString(),
+    thresholdPct,
+  };
+  res.json({ success: true, status: "started", message: "MCF analysis started!" });
+
+  // ---- Background job ----
+  (async () => {
+    try {
+      const pathCounts = {}; // pathKey → { path, conversions, totalValue, currencies }
+      let totalConversions = 0;
+      let after = undefined;
+
+      while (true) {
+        // Fetch contacts with source history + first conversion date
+        let url =
+          "https://api.hubapi.com/crm/v3/objects/contacts?limit=50" +
+          "&properties=hs_first_conversion_date" +
+          "&propertiesWithHistory=hs_latest_source";
+        if (after) url += `&after=${encodeURIComponent(after)}`;
+
+        let data;
+        try {
+          data = await hubspotApiWithRetry(portalId, url);
+        } catch (e) {
+          console.error("MCF: Failed to fetch contacts:", e.message);
+          break;
+        }
+
+        const contacts = Array.isArray(data?.results) ? data.results : [];
+
+        for (const contact of contacts) {
+          mcfJobStatus[jobKey].processed++;
+
+          try {
+            const convResult = await getConversionTimestamp(
+              portalId,
+              contact.id,
+              conversionType,
+              contact.properties || {}
+            );
+
+            if (!convResult) continue;
+
+            const convTs = convResult.timestamp;
+
+            // Only count conversions inside the selected date window
+            if (convTs < start.getTime() || convTs > end.getTime()) continue;
+
+            // Build path from source history
+            const sourceHistory =
+              contact.propertiesWithHistory?.hs_latest_source || [];
+            const path = buildConversionPath(sourceHistory, convTs, MCF_LOOKBACK_DAYS);
+            const key = pathToKey(path);
+
+            if (!pathCounts[key]) {
+              pathCounts[key] = {
+                path,
+                conversions: 0,
+                totalValue: 0,
+                currencies: new Set(),
+              };
+            }
+            pathCounts[key].conversions++;
+            pathCounts[key].totalValue += convResult.value || 0;
+            if (convResult.currency) {
+              pathCounts[key].currencies.add(convResult.currency);
+            }
+
+            totalConversions++;
+            mcfJobStatus[jobKey].converting = totalConversions;
+          } catch (e) {
+            console.warn(`MCF: error on contact ${contact.id}:`, e.message);
+          }
+
+          // Rate-limit pause every 10 contacts
+          if (mcfJobStatus[jobKey].processed % 10 === 0) await msDelay(200);
+        }
+
+        after = data?.paging?.next?.after;
+
+        console.log(
+          `MCF portal ${portalId}: ${mcfJobStatus[jobKey].processed} scanned, ${totalConversions} conversions`
+        );
+
+        if (!after || contacts.length === 0) break;
+      }
+
+      // ---- Apply threshold filter ----
+      const threshNum = Math.max(
+        1,
+        Math.ceil(totalConversions * (thresholdPct / 100))
+      );
+      const topPaths = Object.values(pathCounts)
+        .filter((p) => p.conversions >= threshNum)
+        .sort(
+          (a, b) =>
+            b.conversions - a.conversions || b.totalValue - a.totalValue
+        )
+        .map((p) => ({
+          path: p.path,
+          pathKey: pathToKey(p.path),
+          conversions: p.conversions,
+          conversionValue: Math.round(p.totalValue * 100) / 100,
+          currencies: [...p.currencies],
+        }));
+
+      // Collect all currencies
+      const allCurrencies = new Set();
+      topPaths.forEach((p) =>
+        p.currencies.forEach((c) => allCurrencies.add(c))
+      );
+
+      const result = {
+        paths: topPaths,
+        totalConversions,
+        totalContacts: mcfJobStatus[jobKey].processed,
+        thresholdPct,
+        thresholdCount: threshNum,
+        conversionType,
+        startDate: start.toISOString(),
+        endDate: end.toISOString(),
+        refreshedAt: new Date().toISOString(),
+        currencies: [...allCurrencies],
+        mixedCurrencies: allCurrencies.size > 1,
+        channelLabels: CHANNEL_LABELS,
+      };
+
+      // Persist result keyed by portal + conversion type
+      const allResults = loadMcfResults();
+      allResults[`${portalId}:${conversionType}`] = result;
+      saveMcfResults(allResults);
+
+      mcfJobStatus[jobKey].running = false;
+      mcfJobStatus[jobKey].completedAt = new Date().toISOString();
+      mcfJobStatus[jobKey].result = result;
+
+      console.log(
+        `MCF portal ${portalId}: DONE — ${totalConversions} conversions, ${topPaths.length} qualifying paths.`
+      );
+    } catch (e) {
+      console.error("MCF background error:", e);
+      mcfJobStatus[jobKey].running = false;
+      mcfJobStatus[jobKey].error = e.message;
+    }
+  })();
+});
+
+/** GET /api/mcf/status — poll progress of running MCF job. */
+app.get("/api/mcf/status", async (req, res) => {
+  const portalId = req.query.portalId;
+  if (!portalId) {
+    return res.status(400).json({ success: false, message: "Missing portalId" });
+  }
+
+  const job = mcfJobStatus[String(portalId)];
+
+  if (job?.running) {
+    return res.json({
+      success: true,
+      status: "running",
+      processed: job.processed,
+      converting: job.converting || 0,
+      startedAt: job.startedAt,
+      message: `Processing... ${job.processed} contacts scanned, ${job.converting || 0} conversions found.`,
+    });
+  }
+
+  if (job && !job.running) {
+    return res.json({
+      success: true,
+      status: job.error ? "error" : "completed",
+      processed: job.processed,
+      converting: job.converting || 0,
+      completedAt: job.completedAt || null,
+      error: job.error || null,
+      message: job.error
+        ? `Error: ${job.error}`
+        : `Complete! ${job.processed} contacts scanned, ${job.converting || 0} conversions found.`,
+    });
+  }
+
+  return res.json({
+    success: true,
+    status: "idle",
+    message: "No MCF analysis running.",
+  });
+});
+
+/** GET /api/mcf/result — fetch cached MCF results. */
+app.get("/api/mcf/result", async (req, res) => {
+  const portalId = req.query.portalId;
+  const conversionType = req.query.conversionType || "form_submission";
+  if (!portalId) {
+    return res.status(400).json({ success: false, message: "Missing portalId" });
+  }
+
+  // Check in-memory first (freshest)
+  const job = mcfJobStatus[String(portalId)];
+  if (job?.result && job.result.conversionType === conversionType) {
+    return res.json({ success: true, ...job.result });
+  }
+
+  // Fall back to persisted results
+  const allResults = loadMcfResults();
+  const cached = allResults[`${portalId}:${conversionType}`];
+
+  if (cached) {
+    return res.json({ success: true, ...cached });
+  }
+
+  return res.json({
+    success: true,
+    paths: [],
+    totalConversions: 0,
+    message: "No results available. Run a refresh first.",
+  });
+});
+
+/** GET /api/mcf/conversion-types — returns available conversion type options. */
+app.get("/api/mcf/conversion-types", async (_req, res) => {
+  return res.json({ success: true, conversionTypes: CONVERSION_TYPE_OPTIONS });
 });
 
 // ================================================================

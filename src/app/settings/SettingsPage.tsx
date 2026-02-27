@@ -8,6 +8,15 @@ import {
   Divider,
   Tag,
   Checkbox,
+  Table,
+  TableHead,
+  TableRow,
+  TableHeader,
+  TableBody,
+  TableCell,
+  TableFooter,
+  Select,
+  DateInput,
 } from "@hubspot/ui-extensions";
 import { hubspot } from "@hubspot/ui-extensions";
 
@@ -17,6 +26,86 @@ const BACKEND_URL = "https://api.uspeh.co.uk";
 
 type AnyObj = Record<string, any>;
 type SourceOption = { value: string; label: string };
+
+// ---- MCF Types & Constants ----
+type McfPath = {
+  path: string[];
+  pathKey: string;
+  conversions: number;
+  conversionValue: number;
+  currencies: string[];
+};
+
+type McfResult = {
+  paths: McfPath[];
+  totalConversions: number;
+  totalContacts: number;
+  thresholdPct: number;
+  thresholdCount: number;
+  conversionType: string;
+  startDate: string;
+  endDate: string;
+  refreshedAt: string;
+  currencies: string[];
+  mixedCurrencies: boolean;
+  channelLabels?: Record<string, string>;
+};
+
+type DateVal = { year: number; month: number; date: number };
+
+const CHANNEL_LABELS: Record<string, string> = {
+  ORGANIC_SEARCH: "Organic Search",
+  PAID_SEARCH: "Paid Search",
+  EMAIL_MARKETING: "Email Marketing",
+  SOCIAL_MEDIA: "Social Media",
+  REFERRALS: "Referrals",
+  OTHER_CAMPAIGNS: "Other Campaigns",
+  PAID_SOCIAL: "Paid Social",
+  DISPLAY_ADS: "Display Ads",
+  DIRECT_TRAFFIC: "Direct Traffic",
+  OFFLINE: "Offline",
+  OTHER: "Other",
+  UNKNOWN: "Unknown",
+};
+
+const CHANNEL_TAG_VARIANT: Record<string, "default" | "success" | "warning" | "danger"> = {
+  ORGANIC_SEARCH: "success",
+  PAID_SEARCH: "warning",
+  EMAIL_MARKETING: "danger",
+  SOCIAL_MEDIA: "success",
+  REFERRALS: "default",
+  OTHER_CAMPAIGNS: "warning",
+  PAID_SOCIAL: "warning",
+  DISPLAY_ADS: "danger",
+  DIRECT_TRAFFIC: "default",
+  OFFLINE: "default",
+  OTHER: "default",
+  UNKNOWN: "default",
+};
+
+const CONVERSION_TYPES = [
+  { label: "Form Submission (first-ever)", value: "form_submission" },
+  { label: "Meeting Booked (first-ever)", value: "meeting_booked" },
+  { label: "Deal Created (first-ever)", value: "deal_created" },
+  { label: "Closed-Won Deal (first-ever)", value: "closed_won" },
+];
+
+const THRESHOLD_OPTIONS = [
+  { label: "1%", value: "1" },
+  { label: "5%", value: "5" },
+  { label: "10% (default)", value: "10" },
+  { label: "15%", value: "15" },
+  { label: "20%", value: "20" },
+  { label: "25%", value: "25" },
+];
+
+function toDateVal(d: Date): DateVal {
+  return { year: d.getFullYear(), month: d.getMonth(), date: d.getDate() };
+}
+
+function fromDateVal(dv: DateVal): Date {
+  return new Date(dv.year, dv.month, dv.date);
+}
 
 const SettingsPage = ({ context }: AnyObj) => {
   // --- Analysis state ---
@@ -38,6 +127,20 @@ const SettingsPage = ({ context }: AnyObj) => {
   const [lastSourcesUpdated, setLastSourcesUpdated] = useState<string | null>(
     null
   );
+
+  // --- MCF (Paths) state ---
+  const now = new Date();
+  const [mcfConversionType, setMcfConversionType] = useState("form_submission");
+  const [mcfThreshold, setMcfThreshold] = useState("10");
+  const [mcfStartDate, setMcfStartDate] = useState<DateVal>(
+    toDateVal(new Date(now.getTime() - 90 * 24 * 60 * 60 * 1000))
+  );
+  const [mcfEndDate, setMcfEndDate] = useState<DateVal>(toDateVal(now));
+  const [mcfRunning, setMcfRunning] = useState(false);
+  const [mcfMessage, setMcfMessage] = useState("");
+  const [mcfResult, setMcfResult] = useState<McfResult | null>(null);
+  const [mcfLoadingResult, setMcfLoadingResult] = useState(false);
+  const mcfPollingRef = useRef(false);
 
   // ========================================
   // On mount: load sources + check job status
@@ -241,6 +344,153 @@ const SettingsPage = ({ context }: AnyObj) => {
     const d = new Date(ts);
     return d.toLocaleString();
   };
+
+  // ========================================
+  // MCF Functions
+  // ========================================
+
+  /** Load cached MCF results for the current conversion type. */
+  const loadMcfResult = async (convType?: string) => {
+    setMcfLoadingResult(true);
+    try {
+      const ct = convType || mcfConversionType;
+      const resp = await hubspot.fetch(
+        `${BACKEND_URL}/api/mcf/result?conversionType=${ct}`,
+        { method: "GET" }
+      );
+      const data = await resp.json();
+      if (data.success && data.paths && data.paths.length > 0) {
+        setMcfResult(data as McfResult);
+      } else {
+        setMcfResult(null);
+      }
+    } catch (e: any) {
+      console.error("MCF: Failed to load results:", e);
+    } finally {
+      setMcfLoadingResult(false);
+    }
+  };
+
+  /** Check MCF job status; if running, start polling. */
+  const checkMcfStatus = async () => {
+    try {
+      const resp = await hubspot.fetch(
+        `${BACKEND_URL}/api/mcf/status`,
+        { method: "GET" }
+      );
+      const data = await resp.json();
+      if (data.status === "running") {
+        setMcfRunning(true);
+        setMcfMessage(data.message || "Processing...");
+        if (!mcfPollingRef.current) {
+          mcfPollingRef.current = true;
+          pollMcfStatus();
+        }
+      } else if (data.status === "completed") {
+        setMcfRunning(false);
+        setMcfMessage(data.message || "");
+        loadMcfResult();
+      }
+    } catch (e: any) {
+      console.error("MCF: status check error:", e);
+    }
+  };
+
+  /** Poll MCF status every 3s while a job is running. */
+  const pollMcfStatus = () => {
+    const poll = async () => {
+      try {
+        const resp = await hubspot.fetch(
+          `${BACKEND_URL}/api/mcf/status`,
+          { method: "GET" }
+        );
+        const data = await resp.json();
+
+        if (data.status === "running") {
+          setMcfMessage(data.message || "Processing...");
+          setTimeout(poll, 3000);
+        } else {
+          mcfPollingRef.current = false;
+          setMcfRunning(false);
+          setMcfMessage(
+            data.status === "error"
+              ? `Error: ${data.error || "Unknown"}`
+              : data.message || "Complete!"
+          );
+          // Refresh results
+          loadMcfResult();
+        }
+      } catch (e: any) {
+        mcfPollingRef.current = false;
+        setMcfRunning(false);
+        setMcfMessage(`Error polling status: ${e?.message || "Unknown"}`);
+      }
+    };
+    setTimeout(poll, 3000);
+  };
+
+  /** Start an MCF refresh job. */
+  const startMcfRefresh = async () => {
+    setMcfRunning(true);
+    setMcfMessage("Starting MCF analysis...");
+    setMcfResult(null);
+
+    try {
+      const startD = fromDateVal(mcfStartDate);
+      const endD = fromDateVal(mcfEndDate);
+
+      const resp = await hubspot.fetch(
+        `${BACKEND_URL}/api/mcf/refresh`,
+        {
+          method: "POST",
+          body: {
+            conversionType: mcfConversionType,
+            startDate: startD.toISOString(),
+            endDate: endD.toISOString(),
+            thresholdPct: parseInt(mcfThreshold, 10),
+          },
+        }
+      );
+      const data = await resp.json();
+
+      if (!data.success) {
+        setMcfRunning(false);
+        setMcfMessage(data.message || "Failed to start.");
+        return;
+      }
+
+      setMcfMessage(data.message || "Analysis started...");
+      if (!mcfPollingRef.current) {
+        mcfPollingRef.current = true;
+        pollMcfStatus();
+      }
+    } catch (e: any) {
+      setMcfRunning(false);
+      setMcfMessage(`Error: ${e?.message || "Failed to start MCF analysis"}`);
+    }
+  };
+
+  /** Render a conversion path as UA-style pills with chevrons. */
+  const renderPathPills = (path: string[]) => (
+    <Flex direction="row" gap="extra-small" wrap="wrap" align="center">
+      {path.map((channel: string, idx: number) => (
+        <React.Fragment key={idx}>
+          {idx > 0 && (
+            <Text format={{ fontSize: "small", color: "subtle" }}>{" › "}</Text>
+          )}
+          <Tag variant={CHANNEL_TAG_VARIANT[channel] || "default"}>
+            {CHANNEL_LABELS[channel] || channel}
+          </Tag>
+        </React.Fragment>
+      ))}
+    </Flex>
+  );
+
+  // Load MCF results and check status on mount
+  useEffect(() => {
+    checkMcfStatus();
+    loadMcfResult();
+  }, []);
 
   // Determine button state
   const buttonDisabled = analysisRunning || !analysisAllowed;
@@ -516,6 +766,202 @@ const SettingsPage = ({ context }: AnyObj) => {
               reporting. The timestamp above records when the configuration
               was last modified so you can track any reporting changes.
             </Text>
+          </Flex>
+        </Tab>
+
+        {/* ==================== MCF PATHS TAB ==================== */}
+        <Tab tabId="mcf" title="Paths (MCF)">
+          <Flex direction="column" gap="large">
+            <Text format={{ fontWeight: "bold" }}>
+              Top Conversion Paths
+            </Text>
+            <Text format={{ fontSize: "small" }}>
+              Replicates Google Analytics UA Multi-Channel Funnels &ldquo;Top
+              Conversion Paths&rdquo;. Select a conversion type and date range,
+              then refresh to see which traffic-source journeys lead to
+              conversions.
+            </Text>
+
+            <Divider />
+
+            {/* ---- Filters ---- */}
+            <Flex direction="column" gap="medium">
+              <Select
+                label="Conversion Type"
+                name="mcfConversionType"
+                value={mcfConversionType}
+                onChange={(val: string) => {
+                  setMcfConversionType(val);
+                  loadMcfResult(val);
+                }}
+                options={CONVERSION_TYPES}
+              />
+
+              <Flex direction="row" gap="medium">
+                <DateInput
+                  label="Start Date"
+                  name="mcfStartDate"
+                  value={mcfStartDate}
+                  onChange={(val: any) => {
+                    if (val) setMcfStartDate(val);
+                  }}
+                  format="standard"
+                />
+                <DateInput
+                  label="End Date"
+                  name="mcfEndDate"
+                  value={mcfEndDate}
+                  onChange={(val: any) => {
+                    if (val) setMcfEndDate(val);
+                  }}
+                  format="standard"
+                />
+              </Flex>
+
+              <Select
+                label="Min Path Share (threshold)"
+                name="mcfThreshold"
+                value={mcfThreshold}
+                onChange={(val: string) => setMcfThreshold(val)}
+                options={THRESHOLD_OPTIONS}
+                description="Only show paths representing at least this % of total conversions."
+              />
+            </Flex>
+
+            <Flex direction="row" gap="small">
+              <Button
+                onClick={startMcfRefresh}
+                disabled={mcfRunning}
+                variant="primary"
+              >
+                {mcfRunning ? "Refreshing..." : "Refresh Paths"}
+              </Button>
+              {mcfResult && (
+                <Text format={{ fontSize: "small", color: "subtle" }}>
+                  Last refreshed: {formatTimestamp(mcfResult.refreshedAt)}
+                </Text>
+              )}
+            </Flex>
+
+            {/* ---- Status / progress ---- */}
+            {mcfRunning && (
+              <Flex direction="row" gap="small">
+                <Tag variant="warning">Running</Tag>
+                <Text format={{ fontSize: "small" }}>{mcfMessage}</Text>
+              </Flex>
+            )}
+
+            {!mcfRunning && mcfMessage && (
+              <Text
+                format={{
+                  color: mcfMessage.startsWith("Error") ? "error" : "success",
+                }}
+              >
+                {mcfMessage}
+              </Text>
+            )}
+
+            <Divider />
+
+            {/* ---- Mixed currencies warning ---- */}
+            {mcfResult?.mixedCurrencies && (
+              <Flex direction="row" gap="small">
+                <Tag variant="warning">Mixed Currencies</Tag>
+                <Text format={{ fontSize: "small" }}>
+                  Conversion values include multiple currencies (
+                  {mcfResult.currencies.join(", ")}). Values shown are raw sums
+                  without currency conversion.
+                </Text>
+              </Flex>
+            )}
+
+            {/* ---- Results summary ---- */}
+            {mcfResult && (
+              <Flex direction="column" gap="small">
+                <Text format={{ fontSize: "small" }}>
+                  {mcfResult.totalConversions} total conversion(s) from{" "}
+                  {mcfResult.totalContacts} contacts scanned.
+                  Showing {mcfResult.paths.length} path(s) with{" "}
+                  {"\u2265"}{mcfResult.thresholdCount} conversions (
+                  {mcfResult.thresholdPct}% threshold).
+                </Text>
+              </Flex>
+            )}
+
+            {/* ---- MCF Table ---- */}
+            {mcfLoadingResult && !mcfResult && (
+              <Text format={{ fontSize: "small", color: "subtle" }}>
+                Loading results...
+              </Text>
+            )}
+
+            {mcfResult && mcfResult.paths.length > 0 && (
+              <Table bordered={true} paginated={mcfResult.paths.length > 10} pageCount={Math.ceil(mcfResult.paths.length / 10)}>
+                <TableHead>
+                  <TableRow>
+                    <TableHeader width="max">
+                      MCF Channel Grouping Path
+                    </TableHeader>
+                    <TableHeader width="min" align="right">
+                      Conversions
+                    </TableHeader>
+                    <TableHeader width="min" align="right">
+                      Conv. Value
+                    </TableHeader>
+                  </TableRow>
+                </TableHead>
+                <TableBody>
+                  {mcfResult.paths.map((p) => (
+                    <TableRow key={p.pathKey}>
+                      <TableCell width="max">
+                        {renderPathPills(p.path)}
+                      </TableCell>
+                      <TableCell width="min" align="right">
+                        {p.conversions}
+                      </TableCell>
+                      <TableCell width="min" align="right">
+                        {p.conversionValue > 0
+                          ? p.currencies.length === 1
+                            ? `${p.currencies[0]} ${p.conversionValue.toLocaleString()}`
+                            : p.conversionValue.toLocaleString()
+                          : "\u2014"}
+                      </TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+                <TableFooter>
+                  <TableRow>
+                    <TableHeader>Total</TableHeader>
+                    <TableHeader align="right">
+                      {mcfResult.paths.reduce((s, p) => s + p.conversions, 0)}
+                    </TableHeader>
+                    <TableHeader align="right">
+                      {mcfResult.paths.reduce((s, p) => s + p.conversionValue, 0) > 0
+                        ? mcfResult.paths
+                            .reduce((s, p) => s + p.conversionValue, 0)
+                            .toLocaleString()
+                        : "\u2014"}
+                    </TableHeader>
+                  </TableRow>
+                </TableFooter>
+              </Table>
+            )}
+
+            {mcfResult && mcfResult.paths.length === 0 && !mcfRunning && (
+              <Flex direction="column" gap="small">
+                <Text format={{ fontSize: "small", color: "subtle" }}>
+                  No qualifying paths found. Try lowering the threshold, changing
+                  the conversion type, or expanding the date range.
+                </Text>
+              </Flex>
+            )}
+
+            {!mcfResult && !mcfRunning && !mcfLoadingResult && (
+              <Text format={{ fontSize: "small", color: "subtle" }}>
+                Click &ldquo;Refresh Paths&rdquo; to analyse your
+                contacts&rsquo; conversion journeys.
+              </Text>
+            )}
           </Flex>
         </Tab>
       </Tabs>

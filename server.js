@@ -18,7 +18,6 @@ const BATCH_LIMIT = 300; // contacts per batch call
 
 // ---- MCF (Multi-Channel Funnel) Constants ----
 const MCF_RESULTS_PATH = process.env.MCF_RESULTS_PATH || "./data/mcf-results.json";
-const MCF_LOOKBACK_DAYS = 90;
 
 const CHANNEL_LABELS = {
   ORGANIC_SEARCH: "Organic Search",
@@ -314,195 +313,19 @@ async function getClosedWonStageIds(portalId) {
   }
 }
 
-/**
- * Determine the first-ever conversion timestamp for a contact.
- * Returns { timestamp, value, currency, approximate? } or null.
- */
-async function getConversionTimestamp(portalId, contactId, conversionType, contactProps) {
-  switch (conversionType) {
-    // ---- Form Submission ----
-    case "form_submission": {
-      const dateStr = contactProps?.hs_first_conversion_date;
-      if (!dateStr) return null;
-      const ts = new Date(dateStr).getTime();
-      if (isNaN(ts)) return null;
-      return { timestamp: ts, value: 0, currency: null };
-    }
-
-    // ---- Meeting Booked ----
-    case "meeting_booked": {
-      try {
-        const assocData = await hubspotApiWithRetry(
-          portalId,
-          `https://api.hubapi.com/crm/v3/objects/contacts/${contactId}/associations/meetings?limit=500`
-        );
-        const meetingIds = (assocData.results || []).map((r) =>
-          String(r.toObjectId || r.id)
-        );
-        if (meetingIds.length === 0) return null;
-
-        let earliestTs = Infinity;
-        for (let i = 0; i < meetingIds.length; i++) {
-          try {
-            const meeting = await hubspotApiWithRetry(
-              portalId,
-              `https://api.hubapi.com/crm/v3/objects/meetings/${meetingIds[i]}?properties=hs_meeting_start_time,hs_timestamp`
-            );
-            const raw =
-              meeting.properties?.hs_meeting_start_time ||
-              meeting.properties?.hs_timestamp ||
-              meeting.createdAt;
-            const ts = new Date(raw).getTime();
-            if (!isNaN(ts) && ts < earliestTs) earliestTs = ts;
-          } catch (e) {
-            console.warn(`MCF: skip meeting ${meetingIds[i]}:`, e.message);
-          }
-          if ((i + 1) % 5 === 0) await msDelay(100);
-        }
-        return earliestTs < Infinity
-          ? { timestamp: earliestTs, value: 0, currency: null }
-          : null;
-      } catch (e) {
-        console.warn(`MCF: meetings assoc error contact ${contactId}:`, e.message);
-        return null;
-      }
-    }
-
-    // ---- Deal Created ----
-    case "deal_created": {
-      try {
-        const assocData = await hubspotApiWithRetry(
-          portalId,
-          `https://api.hubapi.com/crm/v3/objects/contacts/${contactId}/associations/deals?limit=500`
-        );
-        const dealIds = (assocData.results || []).map((r) =>
-          String(r.toObjectId || r.id)
-        );
-        if (dealIds.length === 0) return null;
-
-        let earliest = { timestamp: Infinity, value: 0, currency: null };
-        for (let i = 0; i < dealIds.length; i++) {
-          try {
-            const deal = await hubspotApiWithRetry(
-              portalId,
-              `https://api.hubapi.com/crm/v3/objects/deals/${dealIds[i]}?properties=amount,deal_currency_code,createdate`
-            );
-            const ts = new Date(
-              deal.createdAt || deal.properties?.createdate
-            ).getTime();
-            if (!isNaN(ts) && ts < earliest.timestamp) {
-              earliest = {
-                timestamp: ts,
-                value: parseFloat(deal.properties?.amount || "0") || 0,
-                currency: deal.properties?.deal_currency_code || null,
-              };
-            }
-          } catch (e) {
-            console.warn(`MCF: skip deal ${dealIds[i]}:`, e.message);
-          }
-          if ((i + 1) % 5 === 0) await msDelay(100);
-        }
-        return earliest.timestamp < Infinity ? earliest : null;
-      } catch (e) {
-        console.warn(`MCF: deals assoc error contact ${contactId}:`, e.message);
-        return null;
-      }
-    }
-
-    // ---- Closed-Won Deal ----
-    case "closed_won": {
-      try {
-        const closedWonStages = await getClosedWonStageIds(portalId);
-        if (closedWonStages.size === 0) {
-          console.warn(`MCF: no closed-won stages found for portal ${portalId}`);
-          return null;
-        }
-
-        const assocData = await hubspotApiWithRetry(
-          portalId,
-          `https://api.hubapi.com/crm/v3/objects/contacts/${contactId}/associations/deals?limit=500`
-        );
-        const dealIds = (assocData.results || []).map((r) =>
-          String(r.toObjectId || r.id)
-        );
-        if (dealIds.length === 0) return null;
-
-        let earliest = {
-          timestamp: Infinity,
-          value: 0,
-          currency: null,
-          approximate: false,
-        };
-
-        for (let i = 0; i < dealIds.length; i++) {
-          try {
-            const deal = await hubspotApiWithRetry(
-              portalId,
-              `https://api.hubapi.com/crm/v3/objects/deals/${dealIds[i]}?properties=amount,deal_currency_code,closedate,dealstage&propertiesWithHistory=dealstage`
-            );
-
-            const currentStage = deal.properties?.dealstage;
-            if (!closedWonStages.has(currentStage)) continue;
-
-            // Find earliest timestamp when dealstage first became closed-won
-            const stageHistory = deal.propertiesWithHistory?.dealstage || [];
-            let closedWonTs = null;
-            let approximate = false;
-
-            const sorted = [...stageHistory].sort(
-              (a, b) => Number(a.timestamp || 0) - Number(b.timestamp || 0)
-            );
-            for (const entry of sorted) {
-              if (closedWonStages.has(entry.value)) {
-                closedWonTs = Number(entry.timestamp);
-                break;
-              }
-            }
-
-            // Fallback: use closedate (less accurate)
-            if (!closedWonTs && deal.properties?.closedate) {
-              closedWonTs = new Date(deal.properties.closedate).getTime();
-              approximate = true;
-            }
-
-            if (closedWonTs && !isNaN(closedWonTs) && closedWonTs < earliest.timestamp) {
-              earliest = {
-                timestamp: closedWonTs,
-                value: parseFloat(deal.properties?.amount || "0") || 0,
-                currency: deal.properties?.deal_currency_code || null,
-                approximate,
-              };
-            }
-          } catch (e) {
-            console.warn(`MCF: skip deal ${dealIds[i]} (closed-won):`, e.message);
-          }
-          if ((i + 1) % 5 === 0) await msDelay(100);
-        }
-        return earliest.timestamp < Infinity ? earliest : null;
-      } catch (e) {
-        console.warn(`MCF: closed-won assoc error contact ${contactId}:`, e.message);
-        return null;
-      }
-    }
-
-    default:
-      return null;
-  }
-}
+// (getConversionTimestamp removed — replaced by conversion-first finder functions below)
 
 /**
  * Build a conversion path from hs_latest_source history.
- * Only includes entries within [conversionTime - lookbackDays, conversionTime].
+ * Includes ALL entries before the conversion timestamp (no lookback limit).
+ * This captures the full journey leading to conversion.
  * Collapses consecutive duplicate sources.
  */
-function buildConversionPath(sourceHistory, conversionTimestamp, lookbackDays) {
-  const lookbackMs = (lookbackDays || MCF_LOOKBACK_DAYS) * 24 * 60 * 60 * 1000;
-  const windowStart = conversionTimestamp - lookbackMs;
-
+function buildConversionPath(sourceHistory, conversionTimestamp) {
   const entries = (sourceHistory || [])
     .filter((e) => {
       const ts = Number(e.timestamp || 0);
-      return ts >= windowStart && ts <= conversionTimestamp;
+      return ts > 0 && ts <= conversionTimestamp;
     })
     .sort((a, b) => Number(a.timestamp || 0) - Number(b.timestamp || 0));
 
@@ -526,6 +349,379 @@ function buildConversionPath(sourceHistory, conversionTimestamp, lookbackDays) {
 /** Create a stable string key for a path array. */
 function pathToKey(pathArray) {
   return pathArray.join(">");
+}
+
+// ================================================================
+// MCF CONVERSION-FIRST HELPERS
+// Instead of scanning all contacts, start from the conversion objects
+// (meetings, deals, form submissions) and work backwards to contacts.
+// ================================================================
+
+/**
+ * Paginated CRM search. Returns all matching objects.
+ */
+async function searchObjects(portalId, objectType, filterGroups, properties, limit) {
+  const results = [];
+  let after = undefined;
+  const pageSize = Math.min(limit || 100, 100);
+
+  while (true) {
+    const body = { filterGroups, properties, limit: pageSize };
+    if (after) body.after = after;
+
+    const data = await hubspotApiWithRetry(
+      portalId,
+      `https://api.hubapi.com/crm/v3/objects/${objectType}/search`,
+      { method: "POST", body: JSON.stringify(body) }
+    );
+
+    results.push(...(data.results || []));
+    after = data.paging?.next?.after;
+    if (!after || (data.results || []).length === 0) break;
+    await msDelay(100);
+  }
+
+  return results;
+}
+
+/**
+ * Get associated object IDs for a given CRM object.
+ */
+async function getAssociations(portalId, fromType, fromId, toType) {
+  try {
+    const data = await hubspotApiWithRetry(
+      portalId,
+      `https://api.hubapi.com/crm/v3/objects/${fromType}/${fromId}/associations/${toType}?limit=500`
+    );
+    return (data.results || []).map((r) => String(r.toObjectId || r.id));
+  } catch (e) {
+    console.warn(`MCF: getAssociations ${fromType}/${fromId}->${toType} failed:`, e.message);
+    return [];
+  }
+}
+
+// ---- Form Submission (first-ever) ----
+// hs_first_conversion_date IS the first-ever date, so no extra checks needed.
+async function findFormSubmissionConversions(portalId, start, end, jobStatus) {
+  jobStatus.message = "Searching for form submissions in period...";
+
+  const contacts = await searchObjects(
+    portalId,
+    "contacts",
+    [{
+      filters: [{
+        propertyName: "hs_first_conversion_date",
+        operator: "BETWEEN",
+        value: String(start.getTime()),
+        highValue: String(end.getTime()),
+      }],
+    }],
+    ["hs_first_conversion_date"]
+  );
+
+  jobStatus.processed = contacts.length;
+  jobStatus.message = `Found ${contacts.length} first-ever form submissions in period.`;
+
+  const conversions = [];
+  for (const c of contacts) {
+    const d = c.properties?.hs_first_conversion_date;
+    if (d) {
+      const ts = new Date(d).getTime();
+      if (!isNaN(ts)) {
+        conversions.push({ contactId: c.id, conversionTimestamp: ts, conversionValue: 0, currency: null });
+      }
+    }
+  }
+  return conversions;
+}
+
+// ---- Meeting Booked (first-ever) ----
+// 1) Search meetings in date range
+// 2) Get associated contacts for those meetings
+// 3) For each contact, check if they have any EARLIER meetings (outside the period)
+// 4) If no earlier meetings → this is their first-ever → qualifies
+async function findMeetingBookedConversions(portalId, start, end, jobStatus) {
+  jobStatus.message = "Searching for meetings in period...";
+
+  // Step 1: Find all meetings created within the date range
+  const meetings = await searchObjects(
+    portalId,
+    "meetings",
+    [{
+      filters: [{
+        propertyName: "hs_createdate",
+        operator: "BETWEEN",
+        value: String(start.getTime()),
+        highValue: String(end.getTime()),
+      }],
+    }],
+    ["hs_createdate", "hs_meeting_start_time", "hs_timestamp"]
+  );
+
+  jobStatus.message = `Found ${meetings.length} meetings. Getting associated contacts...`;
+
+  // Step 2: Map meetings → contacts (keep earliest meeting per contact in period)
+  const contactMap = {}; // contactId → earliest meeting timestamp in period
+  for (let i = 0; i < meetings.length; i++) {
+    const m = meetings[i];
+    const mTs = new Date(
+      m.properties?.hs_meeting_start_time ||
+      m.properties?.hs_timestamp ||
+      m.properties?.hs_createdate ||
+      m.createdAt
+    ).getTime();
+
+    const contactIds = await getAssociations(portalId, "meetings", m.id, "contacts");
+    for (const cId of contactIds) {
+      if (!contactMap[cId] || mTs < contactMap[cId]) contactMap[cId] = mTs;
+    }
+    if ((i + 1) % 10 === 0) { jobStatus.processed = i + 1; await msDelay(150); }
+  }
+
+  const uniqueContacts = Object.keys(contactMap);
+  jobStatus.message = `${uniqueContacts.length} contacts with meetings. Checking first-ever...`;
+
+  // Step 3: For each contact, verify no earlier meetings exist before the period
+  const conversions = [];
+  for (let i = 0; i < uniqueContacts.length; i++) {
+    const cId = uniqueContacts[i];
+    try {
+      const allMeetingIds = await getAssociations(portalId, "contacts", cId, "meetings");
+      let hasEarlier = false;
+
+      for (const mId of allMeetingIds) {
+        try {
+          const mObj = await hubspotApiWithRetry(
+            portalId,
+            `https://api.hubapi.com/crm/v3/objects/meetings/${mId}?properties=hs_meeting_start_time,hs_timestamp,hs_createdate`
+          );
+          const ts = new Date(
+            mObj.properties?.hs_meeting_start_time ||
+            mObj.properties?.hs_timestamp ||
+            mObj.properties?.hs_createdate ||
+            mObj.createdAt
+          ).getTime();
+          if (!isNaN(ts) && ts < start.getTime()) { hasEarlier = true; break; }
+        } catch (_) { /* skip */ }
+      }
+
+      if (!hasEarlier) {
+        conversions.push({
+          contactId: cId,
+          conversionTimestamp: contactMap[cId],
+          conversionValue: 0,
+          currency: null,
+        });
+      }
+    } catch (e) {
+      console.warn(`MCF: meeting check error contact ${cId}:`, e.message);
+    }
+    if ((i + 1) % 5 === 0) await msDelay(150);
+  }
+
+  jobStatus.converting = conversions.length;
+  jobStatus.message = `Found ${conversions.length} first-ever meeting bookings.`;
+  return conversions;
+}
+
+// ---- Deal Created (first-ever) ----
+// 1) Search deals created in date range
+// 2) Get associated contacts for those deals
+// 3) For each contact, check if they have any EARLIER deals (outside the period)
+// 4) If no earlier deals → first-ever → qualifies
+async function findDealCreatedConversions(portalId, start, end, jobStatus) {
+  jobStatus.message = "Searching for deals created in period...";
+
+  const deals = await searchObjects(
+    portalId,
+    "deals",
+    [{
+      filters: [{
+        propertyName: "createdate",
+        operator: "BETWEEN",
+        value: String(start.getTime()),
+        highValue: String(end.getTime()),
+      }],
+    }],
+    ["createdate", "amount", "deal_currency_code"]
+  );
+
+  jobStatus.message = `Found ${deals.length} deals. Getting associated contacts...`;
+
+  // Map deals → contacts (keep earliest deal per contact)
+  const contactMap = {}; // cId → { ts, value, currency }
+  for (let i = 0; i < deals.length; i++) {
+    const deal = deals[i];
+    const dTs = new Date(deal.properties?.createdate || deal.createdAt).getTime();
+    const dVal = parseFloat(deal.properties?.amount || "0") || 0;
+    const dCur = deal.properties?.deal_currency_code || null;
+
+    const contactIds = await getAssociations(portalId, "deals", deal.id, "contacts");
+    for (const cId of contactIds) {
+      if (!contactMap[cId] || dTs < contactMap[cId].ts) {
+        contactMap[cId] = { ts: dTs, value: dVal, currency: dCur };
+      }
+    }
+    if ((i + 1) % 10 === 0) { jobStatus.processed = i + 1; await msDelay(150); }
+  }
+
+  const uniqueContacts = Object.keys(contactMap);
+  jobStatus.message = `${uniqueContacts.length} contacts with deals. Checking first-ever...`;
+
+  // For each contact, verify no earlier deals exist before the period
+  const conversions = [];
+  for (let i = 0; i < uniqueContacts.length; i++) {
+    const cId = uniqueContacts[i];
+    try {
+      const allDealIds = await getAssociations(portalId, "contacts", cId, "deals");
+      let hasEarlier = false;
+
+      for (const dId of allDealIds) {
+        try {
+          const dObj = await hubspotApiWithRetry(
+            portalId,
+            `https://api.hubapi.com/crm/v3/objects/deals/${dId}?properties=createdate`
+          );
+          const ts = new Date(dObj.properties?.createdate || dObj.createdAt).getTime();
+          if (!isNaN(ts) && ts < start.getTime()) { hasEarlier = true; break; }
+        } catch (_) { /* skip */ }
+      }
+
+      if (!hasEarlier) {
+        const d = contactMap[cId];
+        conversions.push({
+          contactId: cId,
+          conversionTimestamp: d.ts,
+          conversionValue: d.value,
+          currency: d.currency,
+        });
+      }
+    } catch (e) {
+      console.warn(`MCF: deal check error contact ${cId}:`, e.message);
+    }
+    if ((i + 1) % 5 === 0) await msDelay(150);
+  }
+
+  jobStatus.converting = conversions.length;
+  jobStatus.message = `Found ${conversions.length} first-ever deal creations.`;
+  return conversions;
+}
+
+// ---- Closed-Won Deal (first-ever) ----
+// 1) Search deals in closed-won stages with closedate in range
+// 2) Check dealstage history to confirm first closed-won timestamp is in range
+// 3) Get associated contacts
+// 4) For each contact, check if they have any EARLIER closed-won deals
+// 5) If no earlier → first-ever → qualifies
+async function findClosedWonConversions(portalId, start, end, jobStatus) {
+  const closedWonStages = await getClosedWonStageIds(portalId);
+  if (closedWonStages.size === 0) {
+    jobStatus.message = "No closed-won stages found in pipelines.";
+    return [];
+  }
+
+  jobStatus.message = "Searching for closed-won deals in period...";
+
+  const deals = await searchObjects(
+    portalId,
+    "deals",
+    [{
+      filters: [
+        { propertyName: "dealstage", operator: "IN", values: [...closedWonStages] },
+        { propertyName: "closedate", operator: "BETWEEN", value: String(start.getTime()), highValue: String(end.getTime()) },
+      ],
+    }],
+    ["createdate", "closedate", "amount", "deal_currency_code", "dealstage"]
+  );
+
+  jobStatus.message = `Found ${deals.length} closed-won deals. Checking stage history...`;
+
+  // For each deal, confirm it first reached closed-won within the period
+  const qualifyingDeals = [];
+  for (let i = 0; i < deals.length; i++) {
+    const deal = deals[i];
+    try {
+      const dh = await hubspotApiWithRetry(
+        portalId,
+        `https://api.hubapi.com/crm/v3/objects/deals/${deal.id}?properties=amount,deal_currency_code,closedate,dealstage&propertiesWithHistory=dealstage`
+      );
+
+      const history = [...(dh.propertiesWithHistory?.dealstage || [])].sort(
+        (a, b) => Number(a.timestamp || 0) - Number(b.timestamp || 0)
+      );
+      let cwTs = null;
+      for (const e of history) {
+        if (closedWonStages.has(e.value)) { cwTs = Number(e.timestamp); break; }
+      }
+      // Fallback to closedate
+      if (!cwTs && dh.properties?.closedate) cwTs = new Date(dh.properties.closedate).getTime();
+
+      if (cwTs && cwTs >= start.getTime() && cwTs <= end.getTime()) {
+        qualifyingDeals.push({
+          dealId: deal.id,
+          closedWonTs: cwTs,
+          value: parseFloat(dh.properties?.amount || "0") || 0,
+          currency: dh.properties?.deal_currency_code || null,
+        });
+      }
+    } catch (e) {
+      console.warn(`MCF: skip deal ${deal.id} history:`, e.message);
+    }
+    if ((i + 1) % 10 === 0) { jobStatus.processed = i + 1; await msDelay(150); }
+  }
+
+  // Map qualifying deals → contacts
+  const contactMap = {};
+  for (const qd of qualifyingDeals) {
+    const contactIds = await getAssociations(portalId, "deals", qd.dealId, "contacts");
+    for (const cId of contactIds) {
+      if (!contactMap[cId] || qd.closedWonTs < contactMap[cId].closedWonTs) {
+        contactMap[cId] = qd;
+      }
+    }
+  }
+
+  // Check first-ever closed-won per contact
+  const conversions = [];
+  for (const [cId, qd] of Object.entries(contactMap)) {
+    try {
+      const allDealIds = await getAssociations(portalId, "contacts", cId, "deals");
+      let hasEarlier = false;
+
+      for (const dId of allDealIds) {
+        if (dId === qd.dealId) continue;
+        try {
+          const d = await hubspotApiWithRetry(
+            portalId,
+            `https://api.hubapi.com/crm/v3/objects/deals/${dId}?properties=dealstage&propertiesWithHistory=dealstage`
+          );
+          const hist = d.propertiesWithHistory?.dealstage || [];
+          for (const entry of hist) {
+            if (closedWonStages.has(entry.value) && Number(entry.timestamp) < start.getTime()) {
+              hasEarlier = true;
+              break;
+            }
+          }
+          if (hasEarlier) break;
+        } catch (_) { /* skip */ }
+      }
+
+      if (!hasEarlier) {
+        conversions.push({
+          contactId: cId,
+          conversionTimestamp: qd.closedWonTs,
+          conversionValue: qd.value,
+          currency: qd.currency,
+        });
+      }
+    } catch (e) {
+      console.warn(`MCF: closed-won check error contact ${cId}:`, e.message);
+    }
+  }
+
+  jobStatus.converting = conversions.length;
+  jobStatus.message = `Found ${conversions.length} first-ever closed-won deals.`;
+  return conversions;
 }
 
 /**
@@ -962,7 +1158,9 @@ app.post("/api/marketing-sources", async (req, res) => {
 // ================================================================
 const mcfJobStatus = {};
 
-/** POST /api/mcf/refresh — start a background MCF analysis job. */
+/** POST /api/mcf/refresh — start a background MCF analysis job.
+ *  CONVERSION-FIRST approach: starts from conversions, works backwards to contacts.
+ */
 app.post("/api/mcf/refresh", async (req, res) => {
   const portalId = req.query.portalId;
   if (!portalId) {
@@ -978,9 +1176,7 @@ app.post("/api/mcf/refresh", async (req, res) => {
 
   const validTypes = ["form_submission", "meeting_booked", "deal_created", "closed_won"];
   if (!validTypes.includes(conversionType)) {
-    return res
-      .status(400)
-      .json({ success: false, message: `Invalid conversionType: ${conversionType}` });
+    return res.status(400).json({ success: false, message: `Invalid conversionType: ${conversionType}` });
   }
 
   const now = new Date();
@@ -991,17 +1187,15 @@ app.post("/api/mcf/refresh", async (req, res) => {
 
   const jobKey = String(portalId);
 
-  // Prevent duplicate concurrent jobs
   if (mcfJobStatus[jobKey]?.running) {
     return res.json({
       success: true,
       status: "running",
-      message: `MCF analysis already running. ${mcfJobStatus[jobKey].processed} contacts scanned so far.`,
+      message: `MCF analysis already running. ${mcfJobStatus[jobKey].message || ""}`,
       ...mcfJobStatus[jobKey],
     });
   }
 
-  // Respond immediately — processing runs in background
   mcfJobStatus[jobKey] = {
     running: true,
     processed: 0,
@@ -1011,102 +1205,74 @@ app.post("/api/mcf/refresh", async (req, res) => {
     startDate: start.toISOString(),
     endDate: end.toISOString(),
     thresholdPct,
+    message: "Starting...",
   };
   res.json({ success: true, status: "started", message: "MCF analysis started!" });
 
-  // ---- Background job ----
+  // ---- Background job (conversion-first) ----
   (async () => {
     try {
-      const pathCounts = {}; // pathKey → { path, conversions, totalValue, currencies }
-      let totalConversions = 0;
-      let after = undefined;
-
-      while (true) {
-        // Fetch contacts with source history + first conversion date
-        let url =
-          "https://api.hubapi.com/crm/v3/objects/contacts?limit=50" +
-          "&properties=hs_first_conversion_date" +
-          "&propertiesWithHistory=hs_latest_source";
-        if (after) url += `&after=${encodeURIComponent(after)}`;
-
-        let data;
-        try {
-          data = await hubspotApiWithRetry(portalId, url);
-        } catch (e) {
-          console.error("MCF: Failed to fetch contacts:", e.message);
+      // Step 1: Find qualifying first-ever conversions
+      let conversions = [];
+      switch (conversionType) {
+        case "form_submission":
+          conversions = await findFormSubmissionConversions(portalId, start, end, mcfJobStatus[jobKey]);
           break;
-        }
-
-        const contacts = Array.isArray(data?.results) ? data.results : [];
-
-        for (const contact of contacts) {
-          mcfJobStatus[jobKey].processed++;
-
-          try {
-            const convResult = await getConversionTimestamp(
-              portalId,
-              contact.id,
-              conversionType,
-              contact.properties || {}
-            );
-
-            if (!convResult) continue;
-
-            const convTs = convResult.timestamp;
-
-            // Only count conversions inside the selected date window
-            if (convTs < start.getTime() || convTs > end.getTime()) continue;
-
-            // Build path from source history
-            const sourceHistory =
-              contact.propertiesWithHistory?.hs_latest_source || [];
-            const path = buildConversionPath(sourceHistory, convTs, MCF_LOOKBACK_DAYS);
-            const key = pathToKey(path);
-
-            if (!pathCounts[key]) {
-              pathCounts[key] = {
-                path,
-                conversions: 0,
-                totalValue: 0,
-                currencies: new Set(),
-              };
-            }
-            pathCounts[key].conversions++;
-            pathCounts[key].totalValue += convResult.value || 0;
-            if (convResult.currency) {
-              pathCounts[key].currencies.add(convResult.currency);
-            }
-
-            totalConversions++;
-            mcfJobStatus[jobKey].converting = totalConversions;
-          } catch (e) {
-            console.warn(`MCF: error on contact ${contact.id}:`, e.message);
-          }
-
-          // Rate-limit pause every 10 contacts
-          if (mcfJobStatus[jobKey].processed % 10 === 0) await msDelay(200);
-        }
-
-        after = data?.paging?.next?.after;
-
-        console.log(
-          `MCF portal ${portalId}: ${mcfJobStatus[jobKey].processed} scanned, ${totalConversions} conversions`
-        );
-
-        if (!after || contacts.length === 0) break;
+        case "meeting_booked":
+          conversions = await findMeetingBookedConversions(portalId, start, end, mcfJobStatus[jobKey]);
+          break;
+        case "deal_created":
+          conversions = await findDealCreatedConversions(portalId, start, end, mcfJobStatus[jobKey]);
+          break;
+        case "closed_won":
+          conversions = await findClosedWonConversions(portalId, start, end, mcfJobStatus[jobKey]);
+          break;
       }
 
-      // ---- Apply threshold filter ----
-      const threshNum = Math.max(
-        1,
-        Math.ceil(totalConversions * (thresholdPct / 100))
-      );
+      mcfJobStatus[jobKey].converting = conversions.length;
+      mcfJobStatus[jobKey].message = `Found ${conversions.length} first-ever conversions. Building paths...`;
+
+      // Step 2: For each converting contact, fetch source history and build path
+      const pathCounts = {};
+      const processedContacts = new Set();
+
+      for (let i = 0; i < conversions.length; i++) {
+        const conv = conversions[i];
+
+        // A contact can only contribute one first-ever conversion
+        if (processedContacts.has(conv.contactId)) continue;
+        processedContacts.add(conv.contactId);
+
+        try {
+          const contactData = await hubspotApiWithRetry(
+            portalId,
+            `https://api.hubapi.com/crm/v3/objects/contacts/${conv.contactId}?propertiesWithHistory=hs_latest_source`
+          );
+
+          const sourceHistory = contactData.propertiesWithHistory?.hs_latest_source || [];
+          const path = buildConversionPath(sourceHistory, conv.conversionTimestamp);
+          const key = pathToKey(path);
+
+          if (!pathCounts[key]) {
+            pathCounts[key] = { path, conversions: 0, totalValue: 0, currencies: new Set() };
+          }
+          pathCounts[key].conversions++;
+          pathCounts[key].totalValue += conv.conversionValue || 0;
+          if (conv.currency) pathCounts[key].currencies.add(conv.currency);
+        } catch (e) {
+          console.warn(`MCF: path error contact ${conv.contactId}:`, e.message);
+        }
+
+        mcfJobStatus[jobKey].processed = processedContacts.size;
+        if (processedContacts.size % 10 === 0) await msDelay(150);
+      }
+
+      // Step 3: Apply threshold
+      const totalConversions = processedContacts.size;
+      const threshNum = Math.max(1, Math.ceil(totalConversions * (thresholdPct / 100)));
       const topPaths = Object.values(pathCounts)
         .filter((p) => p.conversions >= threshNum)
-        .sort(
-          (a, b) =>
-            b.conversions - a.conversions || b.totalValue - a.totalValue
-        )
+        .sort((a, b) => b.conversions - a.conversions || b.totalValue - a.totalValue)
         .map((p) => ({
           path: p.path,
           pathKey: pathToKey(p.path),
@@ -1115,16 +1281,13 @@ app.post("/api/mcf/refresh", async (req, res) => {
           currencies: [...p.currencies],
         }));
 
-      // Collect all currencies
       const allCurrencies = new Set();
-      topPaths.forEach((p) =>
-        p.currencies.forEach((c) => allCurrencies.add(c))
-      );
+      topPaths.forEach((p) => p.currencies.forEach((c) => allCurrencies.add(c)));
 
       const result = {
         paths: topPaths,
         totalConversions,
-        totalContacts: mcfJobStatus[jobKey].processed,
+        totalContacts: processedContacts.size,
         thresholdPct,
         thresholdCount: threshNum,
         conversionType,
@@ -1136,7 +1299,6 @@ app.post("/api/mcf/refresh", async (req, res) => {
         channelLabels: CHANNEL_LABELS,
       };
 
-      // Persist result keyed by portal + conversion type
       const allResults = loadMcfResults();
       allResults[`${portalId}:${conversionType}`] = result;
       saveMcfResults(allResults);
@@ -1144,14 +1306,14 @@ app.post("/api/mcf/refresh", async (req, res) => {
       mcfJobStatus[jobKey].running = false;
       mcfJobStatus[jobKey].completedAt = new Date().toISOString();
       mcfJobStatus[jobKey].result = result;
+      mcfJobStatus[jobKey].message = `Complete! ${totalConversions} conversions, ${topPaths.length} qualifying paths.`;
 
-      console.log(
-        `MCF portal ${portalId}: DONE — ${totalConversions} conversions, ${topPaths.length} qualifying paths.`
-      );
+      console.log(`MCF portal ${portalId}: DONE — ${totalConversions} conversions, ${topPaths.length} paths.`);
     } catch (e) {
       console.error("MCF background error:", e);
       mcfJobStatus[jobKey].running = false;
       mcfJobStatus[jobKey].error = e.message;
+      mcfJobStatus[jobKey].message = `Error: ${e.message}`;
     }
   })();
 });

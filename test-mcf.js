@@ -12,14 +12,11 @@
 
 // ---- Copy of the pure functions from server.js ----
 
-function buildConversionPath(sourceHistory, conversionTimestamp, lookbackDays) {
-  const lookbackMs = (lookbackDays || 90) * 24 * 60 * 60 * 1000;
-  const windowStart = conversionTimestamp - lookbackMs;
-
+function buildConversionPath(sourceHistory, conversionTimestamp) {
   const entries = (sourceHistory || [])
     .filter((e) => {
       const ts = Number(e.timestamp || 0);
-      return ts >= windowStart && ts <= conversionTimestamp;
+      return ts > 0 && ts <= conversionTimestamp;
     })
     .sort((a, b) => Number(a.timestamp || 0) - Number(b.timestamp || 0));
 
@@ -85,7 +82,7 @@ console.log("\n=== 1. Path Collapse ===\n");
     { timestamp: "200", value: "ORGANIC_SEARCH" },
     { timestamp: "300", value: "DIRECT_TRAFFIC" },
   ];
-  const path = buildConversionPath(history, 400, 90);
+  const path = buildConversionPath(history, 400);
   assertDeepEqual(
     path,
     ["ORGANIC_SEARCH", "DIRECT_TRAFFIC"],
@@ -100,7 +97,7 @@ console.log("\n=== 1. Path Collapse ===\n");
     { timestamp: "200", value: "DIRECT_TRAFFIC" },
     { timestamp: "300", value: "ORGANIC_SEARCH" },
   ];
-  const path = buildConversionPath(history, 400, 90);
+  const path = buildConversionPath(history, 400);
   assertDeepEqual(
     path,
     ["ORGANIC_SEARCH", "DIRECT_TRAFFIC", "ORGANIC_SEARCH"],
@@ -118,7 +115,7 @@ console.log("\n=== 1. Path Collapse ===\n");
     { timestamp: "500", value: "EMAIL_MARKETING" },
     { timestamp: "600", value: "REFERRALS" },
   ];
-  const path = buildConversionPath(history, 700, 90);
+  const path = buildConversionPath(history, 700);
   assertDeepEqual(
     path,
     ["PAID_SEARCH", "EMAIL_MARKETING", "REFERRALS"],
@@ -129,13 +126,13 @@ console.log("\n=== 1. Path Collapse ===\n");
 {
   // Single entry
   const history = [{ timestamp: "100", value: "DIRECT_TRAFFIC" }];
-  const path = buildConversionPath(history, 200, 90);
+  const path = buildConversionPath(history, 200);
   assertDeepEqual(path, ["DIRECT_TRAFFIC"], "Single entry stays as-is");
 }
 
 {
   // Empty history → UNKNOWN
-  const path = buildConversionPath([], 200, 90);
+  const path = buildConversionPath([], 200);
   assertDeepEqual(path, ["UNKNOWN"], "Empty history → [UNKNOWN]");
 }
 
@@ -145,7 +142,7 @@ console.log("\n=== 1. Path Collapse ===\n");
     { timestamp: "100", value: "organic_search" },
     { timestamp: "200", value: "Organic_Search" },
   ];
-  const path = buildConversionPath(history, 300, 90);
+  const path = buildConversionPath(history, 300);
   assertDeepEqual(
     path,
     ["ORGANIC_SEARCH"],
@@ -153,25 +150,37 @@ console.log("\n=== 1. Path Collapse ===\n");
   );
 }
 
-console.log("\n=== 2. Lookback Window Filtering ===\n");
+console.log("\n=== 2. No Lookback Limit (all entries before conversion) ===\n");
 
 {
-  // Only entries within lookback window should be included
-  const convTs = 1000000;
-  const lookbackMs = 90 * 24 * 60 * 60 * 1000;
-  const tooEarly = convTs - lookbackMs - 1;
-  const inWindow = convTs - lookbackMs + 1000;
+  // ALL entries before conversion should be included, no matter how old
+  const convTs = 1000000000; // ~Jan 2001
+  const veryOld = 100000;    // way before
+  const recent = convTs - 1000;
 
   const history = [
-    { timestamp: String(tooEarly), value: "PAID_SEARCH" },
-    { timestamp: String(inWindow), value: "ORGANIC_SEARCH" },
-    { timestamp: String(convTs - 1000), value: "DIRECT_TRAFFIC" },
+    { timestamp: String(veryOld), value: "PAID_SEARCH" },
+    { timestamp: String(recent), value: "ORGANIC_SEARCH" },
   ];
-  const path = buildConversionPath(history, convTs, 90);
+  const path = buildConversionPath(history, convTs);
   assertDeepEqual(
     path,
-    ["ORGANIC_SEARCH", "DIRECT_TRAFFIC"],
-    "Entries outside lookback window are excluded"
+    ["PAID_SEARCH", "ORGANIC_SEARCH"],
+    "Very old entries are included (no lookback limit)"
+  );
+}
+
+{
+  // Entries with timestamp 0 or negative are excluded
+  const history = [
+    { timestamp: "0", value: "PAID_SEARCH" },
+    { timestamp: "100", value: "ORGANIC_SEARCH" },
+  ];
+  const path = buildConversionPath(history, 200);
+  assertDeepEqual(
+    path,
+    ["ORGANIC_SEARCH"],
+    "Entries with timestamp 0 are excluded"
   );
 }
 
@@ -182,7 +191,7 @@ console.log("\n=== 2. Lookback Window Filtering ===\n");
     { timestamp: "300", value: "PAID_SEARCH" },
     { timestamp: "500", value: "DIRECT_TRAFFIC" }, // after conv time
   ];
-  const path = buildConversionPath(history, 400, 90);
+  const path = buildConversionPath(history, 400);
   assertDeepEqual(
     path,
     ["ORGANIC_SEARCH", "PAID_SEARCH"],
@@ -259,7 +268,7 @@ console.log("\n=== 5. Aggregation Determinism ===\n");
   function aggregate(inputs) {
     const counts = {};
     for (const hist of inputs) {
-      const path = buildConversionPath(hist, 300, 90);
+      const path = buildConversionPath(hist, 300);
       const key = pathToKey(path);
       counts[key] = (counts[key] || 0) + 1;
     }

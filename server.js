@@ -310,8 +310,6 @@ async function getClosedWonStageIds(portalId) {
   }
 }
 
-// (getConversionTimestamp removed — replaced by conversion-first finder functions below)
-
 /**
  * Build a conversion path from hs_latest_source history.
  * Includes ALL entries before the conversion timestamp (no lookback limit).
@@ -350,12 +348,13 @@ function pathToKey(pathArray) {
 
 // ================================================================
 // MCF CONVERSION-FIRST HELPERS
-// Instead of scanning all contacts, start from the conversion objects
-// (meetings, deals, form submissions) and work backwards to contacts.
+// DO NOT iterate over all contacts.
+// Start from conversion events, extract contacts, verify first-ever.
 // ================================================================
 
 /**
  * Paginated CRM search. Returns all matching objects.
+ * Automatically paginates through all results.
  */
 async function searchObjects(portalId, objectType, filterGroups, properties, limit) {
   const results = [];
@@ -382,25 +381,113 @@ async function searchObjects(portalId, objectType, filterGroups, properties, lim
 }
 
 /**
- * Get associated object IDs for a given CRM object.
+ * Batch read CRM objects by ID. Uses /crm/v3/objects/{type}/batch/read.
+ * Returns array of objects with their properties.
+ * Supports up to 100 IDs per call, auto-batches larger sets.
  */
-async function getAssociations(portalId, fromType, fromId, toType) {
-  try {
-    const data = await hubspotApiWithRetry(
-      portalId,
-      `https://api.hubapi.com/crm/v3/objects/${fromType}/${fromId}/associations/${toType}?limit=500`
-    );
-    return (data.results || []).map((r) => String(r.toObjectId || r.id));
-  } catch (e) {
-    console.warn(`MCF: getAssociations ${fromType}/${fromId}->${toType} failed:`, e.message);
-    return [];
+async function batchReadObjects(portalId, objectType, ids, properties, propertiesWithHistory) {
+  if (!ids || ids.length === 0) return [];
+  const results = [];
+  const batchSize = 100;
+
+  for (let i = 0; i < ids.length; i += batchSize) {
+    const batch = ids.slice(i, i + batchSize);
+    const body = {
+      inputs: batch.map((id) => ({ id: String(id) })),
+      properties: properties || [],
+    };
+    if (propertiesWithHistory && propertiesWithHistory.length > 0) {
+      body.propertiesWithHistory = propertiesWithHistory;
+    }
+
+    try {
+      const data = await hubspotApiWithRetry(
+        portalId,
+        `https://api.hubapi.com/crm/v3/objects/${objectType}/batch/read`,
+        { method: "POST", body: JSON.stringify(body) }
+      );
+      results.push(...(data.results || []));
+    } catch (e) {
+      console.warn(`batchReadObjects(${objectType}) batch at ${i} failed:`, e.message);
+      // Fallback: read individually
+      for (const id of batch) {
+        try {
+          let url = `https://api.hubapi.com/crm/v3/objects/${objectType}/${id}?`;
+          if (properties?.length) url += `properties=${properties.join(",")}`;
+          if (propertiesWithHistory?.length) url += `&propertiesWithHistory=${propertiesWithHistory.join(",")}`;
+          const obj = await hubspotApiWithRetry(portalId, url);
+          results.push(obj);
+        } catch (_) { /* skip individual failures */ }
+      }
+    }
+
+    if (i + batchSize < ids.length) await msDelay(150);
   }
+
+  return results;
 }
 
-// ---- Form Submission (first-ever) ----
-// hs_first_conversion_date IS the first-ever date, so no extra checks needed.
+/**
+ * Batch get associations using CRM v4 batch API.
+ * Returns a map: { fromId → [toId, ...] }
+ * Falls back to individual v3 calls if v4 fails.
+ */
+async function batchGetAssociations(portalId, fromType, fromIds, toType) {
+  if (!fromIds || fromIds.length === 0) return {};
+  const resultMap = {};
+  const batchSize = 100;
+
+  for (let i = 0; i < fromIds.length; i += batchSize) {
+    const batch = fromIds.slice(i, i + batchSize);
+    const body = { inputs: batch.map((id) => ({ id: String(id) })) };
+
+    try {
+      const data = await hubspotApiWithRetry(
+        portalId,
+        `https://api.hubapi.com/crm/v4/associations/${fromType}/${toType}/batch/read`,
+        { method: "POST", body: JSON.stringify(body) }
+      );
+      for (const r of data.results || []) {
+        const fromId = String(r.from?.id);
+        resultMap[fromId] = (r.to || []).map((t) => String(t.toObjectId));
+      }
+    } catch (e) {
+      console.warn(`batchGetAssociations v4 ${fromType}->${toType} failed at ${i}, falling back:`, e.message);
+      // Fallback to individual v3 calls
+      for (const id of batch) {
+        try {
+          const data = await hubspotApiWithRetry(
+            portalId,
+            `https://api.hubapi.com/crm/v3/objects/${fromType}/${id}/associations/${toType}?limit=500`
+          );
+          resultMap[String(id)] = (data.results || []).map((r) => String(r.toObjectId || r.id));
+        } catch (_) {
+          resultMap[String(id)] = [];
+        }
+      }
+    }
+
+    if (i + batchSize < fromIds.length) await msDelay(150);
+  }
+
+  return resultMap;
+}
+
+// ================================================================
+// CONVERSION FINDER FUNCTIONS
+// Each function:
+//   1. Finds conversion events inside the reporting period
+//   2. Extracts associated contacts
+//   3. Filters to only contacts whose FIRST EVER conversion of that type
+//      falls inside the reporting period
+//   4. Returns { contactId, conversionTimestamp, conversionValue, currency }[]
+// ================================================================
+
+// ---- FORM SUBMISSION (first-ever) ----
+// hs_first_conversion_date IS the first-ever date, so contacts whose
+// hs_first_conversion_date is inside the period automatically qualify.
 async function findFormSubmissionConversions(portalId, start, end, jobStatus) {
-  jobStatus.message = "Searching for form submissions in period...";
+  jobStatus.message = "Step 1: Searching contacts with first form submission in period...";
 
   const contacts = await searchObjects(
     portalId,
@@ -416,8 +503,7 @@ async function findFormSubmissionConversions(portalId, start, end, jobStatus) {
     ["hs_first_conversion_date"]
   );
 
-  jobStatus.processed = contacts.length;
-  jobStatus.message = `Found ${contacts.length} first-ever form submissions in period.`;
+  jobStatus.message = `Found ${contacts.length} contacts with first-ever form submission in period.`;
 
   const conversions = [];
   for (const c of contacts) {
@@ -429,18 +515,19 @@ async function findFormSubmissionConversions(portalId, start, end, jobStatus) {
       }
     }
   }
+
+  jobStatus.converting = conversions.length;
   return conversions;
 }
 
-// ---- Meeting Booked (first-ever) ----
-// 1) Search meetings in date range
-// 2) Get associated contacts for those meetings
-// 3) For each contact, check if they have any EARLIER meetings (outside the period)
-// 4) If no earlier meetings → this is their first-ever → qualifies
+// ---- MEETING BOOKED (first-ever) ----
+// 1. Search meetings created/booked in the reporting period
+// 2. Batch-get associated contacts for those meetings
+// 3. For each contact, batch-read ALL their meetings to check for earlier ones
+// 4. If no earlier meeting exists → first-ever → qualifies
 async function findMeetingBookedConversions(portalId, start, end, jobStatus) {
-  jobStatus.message = "Searching for meetings in period...";
+  jobStatus.message = "Step 1/3: Searching for meetings in reporting period...";
 
-  // Step 1: Find all meetings created within the date range
   const meetings = await searchObjects(
     portalId,
     "meetings",
@@ -455,12 +542,20 @@ async function findMeetingBookedConversions(portalId, start, end, jobStatus) {
     ["hs_createdate", "hs_meeting_start_time", "hs_timestamp"]
   );
 
-  jobStatus.message = `Found ${meetings.length} meetings. Getting associated contacts...`;
+  if (meetings.length === 0) {
+    jobStatus.message = "No meetings found in reporting period.";
+    return [];
+  }
 
-  // Step 2: Map meetings → contacts (keep earliest meeting per contact in period)
-  const contactMap = {}; // contactId → earliest meeting timestamp in period
-  for (let i = 0; i < meetings.length; i++) {
-    const m = meetings[i];
+  jobStatus.message = `Step 2/3: Found ${meetings.length} meetings. Getting associated contacts (batch)...`;
+
+  // Batch-get associations: meeting → contacts
+  const meetingIds = meetings.map((m) => m.id);
+  const meetingAssocs = await batchGetAssociations(portalId, "meetings", meetingIds, "contacts");
+
+  // Build contactMap: contactId → earliest meeting timestamp in period
+  const contactMap = {};
+  for (const m of meetings) {
     const mTs = new Date(
       m.properties?.hs_meeting_start_time ||
       m.properties?.hs_timestamp ||
@@ -468,38 +563,42 @@ async function findMeetingBookedConversions(portalId, start, end, jobStatus) {
       m.createdAt
     ).getTime();
 
-    const contactIds = await getAssociations(portalId, "meetings", m.id, "contacts");
+    const contactIds = meetingAssocs[m.id] || [];
     for (const cId of contactIds) {
       if (!contactMap[cId] || mTs < contactMap[cId]) contactMap[cId] = mTs;
     }
-    if ((i + 1) % 10 === 0) { jobStatus.processed = i + 1; await msDelay(150); }
   }
 
   const uniqueContacts = Object.keys(contactMap);
-  jobStatus.message = `${uniqueContacts.length} contacts with meetings. Checking first-ever...`;
+  if (uniqueContacts.length === 0) {
+    jobStatus.message = "No contacts associated with meetings in period.";
+    return [];
+  }
 
-  // Step 3: For each contact, verify no earlier meetings exist before the period
+  jobStatus.message = `Step 3/3: Verifying first-ever meeting for ${uniqueContacts.length} contacts...`;
+
+  // For each contact, get ALL their meeting IDs, then batch-read to check dates
   const conversions = [];
+  const contactAssocs = await batchGetAssociations(portalId, "contacts", uniqueContacts, "meetings");
+
   for (let i = 0; i < uniqueContacts.length; i++) {
     const cId = uniqueContacts[i];
     try {
-      const allMeetingIds = await getAssociations(portalId, "contacts", cId, "meetings");
-      let hasEarlier = false;
+      const allMeetingIds = contactAssocs[cId] || [];
+      // Batch-read all meetings for this contact
+      const allMeetings = await batchReadObjects(portalId, "meetings", allMeetingIds, [
+        "hs_createdate", "hs_meeting_start_time", "hs_timestamp",
+      ]);
 
-      for (const mId of allMeetingIds) {
-        try {
-          const mObj = await hubspotApiWithRetry(
-            portalId,
-            `https://api.hubapi.com/crm/v3/objects/meetings/${mId}?properties=hs_meeting_start_time,hs_timestamp,hs_createdate`
-          );
-          const ts = new Date(
-            mObj.properties?.hs_meeting_start_time ||
-            mObj.properties?.hs_timestamp ||
-            mObj.properties?.hs_createdate ||
-            mObj.createdAt
-          ).getTime();
-          if (!isNaN(ts) && ts < start.getTime()) { hasEarlier = true; break; }
-        } catch (_) { /* skip */ }
+      let hasEarlier = false;
+      for (const m of allMeetings) {
+        const ts = new Date(
+          m.properties?.hs_meeting_start_time ||
+          m.properties?.hs_timestamp ||
+          m.properties?.hs_createdate ||
+          m.createdAt
+        ).getTime();
+        if (!isNaN(ts) && ts < start.getTime()) { hasEarlier = true; break; }
       }
 
       if (!hasEarlier) {
@@ -513,21 +612,25 @@ async function findMeetingBookedConversions(portalId, start, end, jobStatus) {
     } catch (e) {
       console.warn(`MCF: meeting check error contact ${cId}:`, e.message);
     }
-    if ((i + 1) % 5 === 0) await msDelay(150);
+
+    if ((i + 1) % 10 === 0) {
+      jobStatus.message = `Step 3/3: Verified ${i + 1}/${uniqueContacts.length} contacts. ${conversions.length} qualifying so far.`;
+      await msDelay(100);
+    }
   }
 
   jobStatus.converting = conversions.length;
-  jobStatus.message = `Found ${conversions.length} first-ever meeting bookings.`;
+  jobStatus.message = `Found ${conversions.length} contacts with first-ever meeting in period.`;
   return conversions;
 }
 
-// ---- Deal Created (first-ever) ----
-// 1) Search deals created in date range
-// 2) Get associated contacts for those deals
-// 3) For each contact, check if they have any EARLIER deals (outside the period)
-// 4) If no earlier deals → first-ever → qualifies
+// ---- DEAL CREATED (first-ever) ----
+// 1. Search deals where createdate is within reporting period
+// 2. Batch-get associated contacts for those deals
+// 3. For each contact, batch-read ALL their deals to check for earlier ones
+// 4. If no earlier deal exists → first-ever → qualifies
 async function findDealCreatedConversions(portalId, start, end, jobStatus) {
-  jobStatus.message = "Searching for deals created in period...";
+  jobStatus.message = "Step 1/3: Searching for deals created in reporting period...";
 
   const deals = await searchObjects(
     portalId,
@@ -543,73 +646,87 @@ async function findDealCreatedConversions(portalId, start, end, jobStatus) {
     ["createdate", "amount", "deal_currency_code"]
   );
 
-  jobStatus.message = `Found ${deals.length} deals. Getting associated contacts...`;
+  if (deals.length === 0) {
+    jobStatus.message = "No deals found in reporting period.";
+    return [];
+  }
 
-  // Map deals → contacts (keep earliest deal per contact)
-  const contactMap = {}; // cId → { ts, value, currency }
-  for (let i = 0; i < deals.length; i++) {
-    const deal = deals[i];
+  jobStatus.message = `Step 2/3: Found ${deals.length} deals. Getting associated contacts (batch)...`;
+
+  // Batch-get associations: deal → contacts
+  const dealIds = deals.map((d) => d.id);
+  const dealAssocs = await batchGetAssociations(portalId, "deals", dealIds, "contacts");
+
+  // Build contactMap: contactId → { ts, value, currency } (keep earliest deal per contact)
+  const contactMap = {};
+  for (const deal of deals) {
     const dTs = new Date(deal.properties?.createdate || deal.createdAt).getTime();
     const dVal = parseFloat(deal.properties?.amount || "0") || 0;
     const dCur = deal.properties?.deal_currency_code || null;
 
-    const contactIds = await getAssociations(portalId, "deals", deal.id, "contacts");
+    const contactIds = dealAssocs[deal.id] || [];
     for (const cId of contactIds) {
       if (!contactMap[cId] || dTs < contactMap[cId].ts) {
         contactMap[cId] = { ts: dTs, value: dVal, currency: dCur };
       }
     }
-    if ((i + 1) % 10 === 0) { jobStatus.processed = i + 1; await msDelay(150); }
   }
 
   const uniqueContacts = Object.keys(contactMap);
-  jobStatus.message = `${uniqueContacts.length} contacts with deals. Checking first-ever...`;
+  if (uniqueContacts.length === 0) {
+    jobStatus.message = "No contacts associated with deals in period.";
+    return [];
+  }
 
-  // For each contact, verify no earlier deals exist before the period
+  jobStatus.message = `Step 3/3: Verifying first-ever deal for ${uniqueContacts.length} contacts...`;
+
+  // For each contact, get ALL their deal IDs, then batch-read to check createdates
   const conversions = [];
+  const contactAssocs = await batchGetAssociations(portalId, "contacts", uniqueContacts, "deals");
+
   for (let i = 0; i < uniqueContacts.length; i++) {
     const cId = uniqueContacts[i];
     try {
-      const allDealIds = await getAssociations(portalId, "contacts", cId, "deals");
-      let hasEarlier = false;
+      const allDealIds = contactAssocs[cId] || [];
+      // Batch-read all deals for this contact to get their createdates
+      const allDeals = await batchReadObjects(portalId, "deals", allDealIds, ["createdate"]);
 
-      for (const dId of allDealIds) {
-        try {
-          const dObj = await hubspotApiWithRetry(
-            portalId,
-            `https://api.hubapi.com/crm/v3/objects/deals/${dId}?properties=createdate`
-          );
-          const ts = new Date(dObj.properties?.createdate || dObj.createdAt).getTime();
-          if (!isNaN(ts) && ts < start.getTime()) { hasEarlier = true; break; }
-        } catch (_) { /* skip */ }
+      let hasEarlier = false;
+      for (const d of allDeals) {
+        const ts = new Date(d.properties?.createdate || d.createdAt).getTime();
+        if (!isNaN(ts) && ts < start.getTime()) { hasEarlier = true; break; }
       }
 
       if (!hasEarlier) {
-        const d = contactMap[cId];
+        const info = contactMap[cId];
         conversions.push({
           contactId: cId,
-          conversionTimestamp: d.ts,
-          conversionValue: d.value,
-          currency: d.currency,
+          conversionTimestamp: info.ts,
+          conversionValue: info.value,
+          currency: info.currency,
         });
       }
     } catch (e) {
       console.warn(`MCF: deal check error contact ${cId}:`, e.message);
     }
-    if ((i + 1) % 5 === 0) await msDelay(150);
+
+    if ((i + 1) % 10 === 0) {
+      jobStatus.message = `Step 3/3: Verified ${i + 1}/${uniqueContacts.length} contacts. ${conversions.length} qualifying so far.`;
+      await msDelay(100);
+    }
   }
 
   jobStatus.converting = conversions.length;
-  jobStatus.message = `Found ${conversions.length} first-ever deal creations.`;
+  jobStatus.message = `Found ${conversions.length} contacts with first-ever deal in period.`;
   return conversions;
 }
 
-// ---- Closed-Won Deal (first-ever) ----
-// 1) Search deals in closed-won stages with closedate in range
-// 2) Check dealstage history to confirm first closed-won timestamp is in range
-// 3) Get associated contacts
-// 4) For each contact, check if they have any EARLIER closed-won deals
-// 5) If no earlier → first-ever → qualifies
+// ---- CLOSED-WON DEAL (first-ever) ----
+// 1. Search deals in closed-won stages with closedate in reporting period
+// 2. Verify first closed-won timestamp is within the period (dealstage history)
+// 3. Batch-get associated contacts for qualifying deals
+// 4. For each contact, check if they have any EARLIER closed-won deals
+// 5. If no earlier → first-ever → qualifies
 async function findClosedWonConversions(portalId, start, end, jobStatus) {
   const closedWonStages = await getClosedWonStageIds(portalId);
   if (closedWonStages.size === 0) {
@@ -617,7 +734,7 @@ async function findClosedWonConversions(portalId, start, end, jobStatus) {
     return [];
   }
 
-  jobStatus.message = "Searching for closed-won deals in period...";
+  jobStatus.message = "Step 1/4: Searching for closed-won deals in period...";
 
   const deals = await searchObjects(
     portalId,
@@ -631,46 +748,63 @@ async function findClosedWonConversions(portalId, start, end, jobStatus) {
     ["createdate", "closedate", "amount", "deal_currency_code", "dealstage"]
   );
 
-  jobStatus.message = `Found ${deals.length} closed-won deals. Checking stage history...`;
-
-  // For each deal, confirm it first reached closed-won within the period
-  const qualifyingDeals = [];
-  for (let i = 0; i < deals.length; i++) {
-    const deal = deals[i];
-    try {
-      const dh = await hubspotApiWithRetry(
-        portalId,
-        `https://api.hubapi.com/crm/v3/objects/deals/${deal.id}?properties=amount,deal_currency_code,closedate,dealstage&propertiesWithHistory=dealstage`
-      );
-
-      const history = [...(dh.propertiesWithHistory?.dealstage || [])].sort(
-        (a, b) => Number(a.timestamp || 0) - Number(b.timestamp || 0)
-      );
-      let cwTs = null;
-      for (const e of history) {
-        if (closedWonStages.has(e.value)) { cwTs = Number(e.timestamp); break; }
-      }
-      // Fallback to closedate
-      if (!cwTs && dh.properties?.closedate) cwTs = new Date(dh.properties.closedate).getTime();
-
-      if (cwTs && cwTs >= start.getTime() && cwTs <= end.getTime()) {
-        qualifyingDeals.push({
-          dealId: deal.id,
-          closedWonTs: cwTs,
-          value: parseFloat(dh.properties?.amount || "0") || 0,
-          currency: dh.properties?.deal_currency_code || null,
-        });
-      }
-    } catch (e) {
-      console.warn(`MCF: skip deal ${deal.id} history:`, e.message);
-    }
-    if ((i + 1) % 10 === 0) { jobStatus.processed = i + 1; await msDelay(150); }
+  if (deals.length === 0) {
+    jobStatus.message = "No closed-won deals found in reporting period.";
+    return [];
   }
 
-  // Map qualifying deals → contacts
+  jobStatus.message = `Step 2/4: Found ${deals.length} closed-won deals. Verifying stage history...`;
+
+  // For each deal, verify that the first time it reached closed-won was within the period
+  // Need propertiesWithHistory=dealstage — batch read supports this
+  const dealsWithHistory = await batchReadObjects(
+    portalId, "deals", deals.map((d) => d.id),
+    ["amount", "deal_currency_code", "closedate", "dealstage"],
+    ["dealstage"]
+  );
+
+  const qualifyingDeals = [];
+  for (let i = 0; i < dealsWithHistory.length; i++) {
+    const dh = dealsWithHistory[i];
+    const history = [...(dh.propertiesWithHistory?.dealstage || [])].sort(
+      (a, b) => Number(a.timestamp || 0) - Number(b.timestamp || 0)
+    );
+    let cwTs = null;
+    for (const e of history) {
+      if (closedWonStages.has(e.value)) { cwTs = Number(e.timestamp); break; }
+    }
+    // Fallback to closedate
+    if (!cwTs && dh.properties?.closedate) cwTs = new Date(dh.properties.closedate).getTime();
+
+    if (cwTs && cwTs >= start.getTime() && cwTs <= end.getTime()) {
+      qualifyingDeals.push({
+        dealId: dh.id,
+        closedWonTs: cwTs,
+        value: parseFloat(dh.properties?.amount || "0") || 0,
+        currency: dh.properties?.deal_currency_code || null,
+      });
+    }
+
+    if ((i + 1) % 20 === 0) {
+      jobStatus.message = `Step 2/4: Verified ${i + 1}/${dealsWithHistory.length} deal histories. ${qualifyingDeals.length} qualifying.`;
+    }
+  }
+
+  if (qualifyingDeals.length === 0) {
+    jobStatus.message = "No deals first reached closed-won within the period.";
+    return [];
+  }
+
+  jobStatus.message = `Step 3/4: ${qualifyingDeals.length} qualifying deals. Getting associated contacts (batch)...`;
+
+  // Batch-get associations: deal → contacts
+  const qualDealIds = qualifyingDeals.map((d) => d.dealId);
+  const dealAssocs = await batchGetAssociations(portalId, "deals", qualDealIds, "contacts");
+
+  // Build contactMap: contactId → qualifying deal info (keep earliest closed-won per contact)
   const contactMap = {};
   for (const qd of qualifyingDeals) {
-    const contactIds = await getAssociations(portalId, "deals", qd.dealId, "contacts");
+    const contactIds = dealAssocs[qd.dealId] || [];
     for (const cId of contactIds) {
       if (!contactMap[cId] || qd.closedWonTs < contactMap[cId].closedWonTs) {
         contactMap[cId] = qd;
@@ -678,29 +812,48 @@ async function findClosedWonConversions(portalId, start, end, jobStatus) {
     }
   }
 
-  // Check first-ever closed-won per contact
-  const conversions = [];
-  for (const [cId, qd] of Object.entries(contactMap)) {
-    try {
-      const allDealIds = await getAssociations(portalId, "contacts", cId, "deals");
-      let hasEarlier = false;
+  const uniqueContacts = Object.keys(contactMap);
+  if (uniqueContacts.length === 0) {
+    jobStatus.message = "No contacts associated with qualifying closed-won deals.";
+    return [];
+  }
 
-      for (const dId of allDealIds) {
-        if (dId === qd.dealId) continue;
-        try {
-          const d = await hubspotApiWithRetry(
-            portalId,
-            `https://api.hubapi.com/crm/v3/objects/deals/${dId}?properties=dealstage&propertiesWithHistory=dealstage`
-          );
-          const hist = d.propertiesWithHistory?.dealstage || [];
-          for (const entry of hist) {
-            if (closedWonStages.has(entry.value) && Number(entry.timestamp) < start.getTime()) {
-              hasEarlier = true;
-              break;
-            }
+  jobStatus.message = `Step 4/4: Verifying first-ever closed-won for ${uniqueContacts.length} contacts...`;
+
+  // For each contact, check if they have any EARLIER closed-won deals
+  const conversions = [];
+  const contactAssocs = await batchGetAssociations(portalId, "contacts", uniqueContacts, "deals");
+
+  for (let i = 0; i < uniqueContacts.length; i++) {
+    const cId = uniqueContacts[i];
+    const qd = contactMap[cId];
+    try {
+      const allDealIds = (contactAssocs[cId] || []).filter((dId) => dId !== qd.dealId);
+
+      if (allDealIds.length === 0) {
+        // Only one deal — it's definitely the first-ever
+        conversions.push({
+          contactId: cId,
+          conversionTimestamp: qd.closedWonTs,
+          conversionValue: qd.value,
+          currency: qd.currency,
+        });
+        continue;
+      }
+
+      // Batch-read other deals with dealstage history
+      const otherDeals = await batchReadObjects(portalId, "deals", allDealIds, ["dealstage"], ["dealstage"]);
+
+      let hasEarlier = false;
+      for (const d of otherDeals) {
+        const hist = d.propertiesWithHistory?.dealstage || [];
+        for (const entry of hist) {
+          if (closedWonStages.has(entry.value) && Number(entry.timestamp) < start.getTime()) {
+            hasEarlier = true;
+            break;
           }
-          if (hasEarlier) break;
-        } catch (_) { /* skip */ }
+        }
+        if (hasEarlier) break;
       }
 
       if (!hasEarlier) {
@@ -714,10 +867,15 @@ async function findClosedWonConversions(portalId, start, end, jobStatus) {
     } catch (e) {
       console.warn(`MCF: closed-won check error contact ${cId}:`, e.message);
     }
+
+    if ((i + 1) % 10 === 0) {
+      jobStatus.message = `Step 4/4: Verified ${i + 1}/${uniqueContacts.length} contacts. ${conversions.length} qualifying so far.`;
+      await msDelay(100);
+    }
   }
 
   jobStatus.converting = conversions.length;
-  jobStatus.message = `Found ${conversions.length} first-ever closed-won deals.`;
+  jobStatus.message = `Found ${conversions.length} contacts with first-ever closed-won deal in period.`;
   return conversions;
 }
 
@@ -1156,7 +1314,15 @@ app.post("/api/marketing-sources", async (req, res) => {
 const mcfJobStatus = {};
 
 /** POST /api/mcf/refresh — start a background MCF analysis job.
- *  CONVERSION-FIRST approach: starts from conversions, works backwards to contacts.
+ *  CONVERSION-FIRST approach:
+ *    1. Find conversion events in reporting period (deals/meetings/forms)
+ *    2. Extract associated contacts
+ *    3. Filter to contacts whose FIRST EVER conversion of that type is in the period
+ *    4. For qualifying contacts only: pull full hs_latest_source history,
+ *       truncate at conversion timestamp, build ordered paths
+ *    5. Aggregate and return ranked paths
+ *
+ *  DOES NOT iterate over all contacts — only touches converting entities.
  */
 app.post("/api/mcf/refresh", async (req, res) => {
   const portalId = req.query.portalId;
@@ -1188,7 +1354,7 @@ app.post("/api/mcf/refresh", async (req, res) => {
     return res.json({
       success: true,
       status: "running",
-      message: `MCF analysis already running. ${mcfJobStatus[jobKey].message || ""}`,
+      message: mcfJobStatus[jobKey].message || "MCF analysis already running.",
       ...mcfJobStatus[jobKey],
     });
   }
@@ -1197,19 +1363,27 @@ app.post("/api/mcf/refresh", async (req, res) => {
     running: true,
     processed: 0,
     converting: 0,
+    pathsBuilt: 0,
     startedAt: new Date().toISOString(),
     conversionType,
     startDate: start.toISOString(),
     endDate: end.toISOString(),
     thresholdPct,
-    message: "Starting...",
+    message: "Starting conversion-first analysis...",
   };
-  res.json({ success: true, status: "started", message: "MCF analysis started!" });
+  res.json({ success: true, status: "started", message: "MCF analysis started (conversion-first)." });
 
   // ---- Background job (conversion-first) ----
   (async () => {
     try {
-      // Step 1: Find qualifying first-ever conversions
+      console.log(`MCF portal ${portalId}: Starting ${conversionType} analysis [${start.toISOString()} — ${end.toISOString()}]`);
+
+      // ━━━ Phase 1: Find qualifying first-ever conversions ━━━
+      // Each finder function:
+      //   a) Searches conversion events in reporting period
+      //   b) Extracts associated contacts
+      //   c) Verifies the conversion is the FIRST EVER of that type for each contact
+      //   d) Returns only qualifying { contactId, conversionTimestamp, conversionValue, currency }
       let conversions = [];
       switch (conversionType) {
         case "form_submission":
@@ -1227,45 +1401,79 @@ app.post("/api/mcf/refresh", async (req, res) => {
       }
 
       mcfJobStatus[jobKey].converting = conversions.length;
-      mcfJobStatus[jobKey].message = `Found ${conversions.length} first-ever conversions. Building paths...`;
 
-      // Step 2: For each converting contact, fetch source history and build path
-      const pathCounts = {};
-      const processedContacts = new Set();
-
-      for (let i = 0; i < conversions.length; i++) {
-        const conv = conversions[i];
-
-        // A contact can only contribute one first-ever conversion
-        if (processedContacts.has(conv.contactId)) continue;
-        processedContacts.add(conv.contactId);
-
-        try {
-          const contactData = await hubspotApiWithRetry(
-            portalId,
-            `https://api.hubapi.com/crm/v3/objects/contacts/${conv.contactId}?propertiesWithHistory=hs_latest_source`
-          );
-
-          const sourceHistory = contactData.propertiesWithHistory?.hs_latest_source || [];
-          const path = buildConversionPath(sourceHistory, conv.conversionTimestamp);
-          const key = pathToKey(path);
-
-          if (!pathCounts[key]) {
-            pathCounts[key] = { path, conversions: 0, totalValue: 0, currencies: new Set() };
-          }
-          pathCounts[key].conversions++;
-          pathCounts[key].totalValue += conv.conversionValue || 0;
-          if (conv.currency) pathCounts[key].currencies.add(conv.currency);
-        } catch (e) {
-          console.warn(`MCF: path error contact ${conv.contactId}:`, e.message);
-        }
-
-        mcfJobStatus[jobKey].processed = processedContacts.size;
-        if (processedContacts.size % 10 === 0) await msDelay(150);
+      if (conversions.length === 0) {
+        mcfJobStatus[jobKey].running = false;
+        mcfJobStatus[jobKey].completedAt = new Date().toISOString();
+        mcfJobStatus[jobKey].message = "Complete — no qualifying first-ever conversions found in the period.";
+        mcfJobStatus[jobKey].result = {
+          paths: [], totalConversions: 0, totalContacts: 0,
+          thresholdPct, thresholdCount: 0, conversionType,
+          startDate: start.toISOString(), endDate: end.toISOString(),
+          refreshedAt: new Date().toISOString(), currencies: [],
+          mixedCurrencies: false, channelLabels: CHANNEL_LABELS,
+        };
+        // Persist empty result
+        const allResults = loadMcfResults();
+        allResults[`${portalId}:${conversionType}`] = mcfJobStatus[jobKey].result;
+        saveMcfResults(allResults);
+        return;
       }
 
-      // Step 3: Apply threshold
-      const totalConversions = processedContacts.size;
+      // ━━━ Phase 2: Build traffic source paths for qualifying contacts ━━━
+      mcfJobStatus[jobKey].message = `Building paths for ${conversions.length} qualifying conversions...`;
+
+      // Deduplicate by contactId (one contact = one first-ever conversion)
+      const contactConvMap = new Map();
+      for (const conv of conversions) {
+        if (!contactConvMap.has(conv.contactId)) {
+          contactConvMap.set(conv.contactId, conv);
+        }
+      }
+
+      const uniqueContactIds = [...contactConvMap.keys()];
+
+      // Batch-read contacts with hs_latest_source history
+      // (batch read supports propertiesWithHistory)
+      const contactsWithHistory = await batchReadObjects(
+        portalId, "contacts", uniqueContactIds,
+        ["hs_latest_source"],
+        ["hs_latest_source"]
+      );
+
+      // Index by ID for fast lookup
+      const contactHistoryMap = {};
+      for (const c of contactsWithHistory) {
+        contactHistoryMap[c.id] = c.propertiesWithHistory?.hs_latest_source || [];
+      }
+
+      // Build paths and aggregate
+      const pathCounts = {};
+      let pathsBuilt = 0;
+
+      for (const [contactId, conv] of contactConvMap) {
+        const sourceHistory = contactHistoryMap[contactId] || [];
+        const path = buildConversionPath(sourceHistory, conv.conversionTimestamp);
+        const key = pathToKey(path);
+
+        if (!pathCounts[key]) {
+          pathCounts[key] = { path, conversions: 0, totalValue: 0, currencies: new Set() };
+        }
+        pathCounts[key].conversions++;
+        pathCounts[key].totalValue += conv.conversionValue || 0;
+        if (conv.currency) pathCounts[key].currencies.add(conv.currency);
+
+        pathsBuilt++;
+        if (pathsBuilt % 25 === 0) {
+          mcfJobStatus[jobKey].pathsBuilt = pathsBuilt;
+          mcfJobStatus[jobKey].message = `Building paths: ${pathsBuilt}/${uniqueContactIds.length} done.`;
+        }
+      }
+
+      mcfJobStatus[jobKey].pathsBuilt = pathsBuilt;
+
+      // ━━━ Phase 3: Apply threshold and rank ━━━
+      const totalConversions = contactConvMap.size;
       const threshNum = Math.max(1, Math.ceil(totalConversions * (thresholdPct / 100)));
       const topPaths = Object.values(pathCounts)
         .filter((p) => p.conversions >= threshNum)
@@ -1284,7 +1492,7 @@ app.post("/api/mcf/refresh", async (req, res) => {
       const result = {
         paths: topPaths,
         totalConversions,
-        totalContacts: processedContacts.size,
+        totalContacts: contactConvMap.size,
         thresholdPct,
         thresholdCount: threshNum,
         conversionType,
@@ -1296,6 +1504,7 @@ app.post("/api/mcf/refresh", async (req, res) => {
         channelLabels: CHANNEL_LABELS,
       };
 
+      // Persist to file
       const allResults = loadMcfResults();
       allResults[`${portalId}:${conversionType}`] = result;
       saveMcfResults(allResults);
@@ -1303,9 +1512,9 @@ app.post("/api/mcf/refresh", async (req, res) => {
       mcfJobStatus[jobKey].running = false;
       mcfJobStatus[jobKey].completedAt = new Date().toISOString();
       mcfJobStatus[jobKey].result = result;
-      mcfJobStatus[jobKey].message = `Complete! ${totalConversions} conversions, ${topPaths.length} qualifying paths.`;
+      mcfJobStatus[jobKey].message = `Complete! ${totalConversions} first-ever conversions → ${topPaths.length} qualifying paths (threshold ≥${threshNum}).`;
 
-      console.log(`MCF portal ${portalId}: DONE — ${totalConversions} conversions, ${topPaths.length} paths.`);
+      console.log(`MCF portal ${portalId}: DONE — ${totalConversions} conversions, ${topPaths.length} paths above threshold.`);
     } catch (e) {
       console.error("MCF background error:", e);
       mcfJobStatus[jobKey].running = false;
@@ -1328,10 +1537,11 @@ app.get("/api/mcf/status", async (req, res) => {
     return res.json({
       success: true,
       status: "running",
-      processed: job.processed,
       converting: job.converting || 0,
+      pathsBuilt: job.pathsBuilt || 0,
       startedAt: job.startedAt,
-      message: job.message || `Processing... ${job.converting || 0} conversions found so far.`,
+      conversionType: job.conversionType,
+      message: job.message || "Processing...",
     });
   }
 
@@ -1339,20 +1549,21 @@ app.get("/api/mcf/status", async (req, res) => {
     return res.json({
       success: true,
       status: job.error ? "error" : "completed",
-      processed: job.processed,
       converting: job.converting || 0,
+      pathsBuilt: job.pathsBuilt || 0,
       completedAt: job.completedAt || null,
       error: job.error || null,
+      conversionType: job.conversionType,
       message: job.message || (job.error
         ? `Error: ${job.error}`
-        : `Complete! ${job.converting || 0} conversions, ${job.processed} contacts processed.`),
+        : `Complete! ${job.converting || 0} first-ever conversions, ${job.pathsBuilt || 0} paths built.`),
     });
   }
 
   return res.json({
     success: true,
     status: "idle",
-    message: "No MCF analysis running.",
+    message: "No MCF analysis running. Click Refresh to start.",
   });
 });
 

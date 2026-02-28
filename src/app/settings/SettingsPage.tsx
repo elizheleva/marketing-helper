@@ -776,8 +776,7 @@ const SettingsPage = ({ context }: AnyObj) => {
             {mcfResult && (
               <Flex direction="column" gap="small">
                 <Text format={{ fontSize: "small" }}>
-                  {mcfResult.totalConversions} total conversion(s) from{" "}
-                  {mcfResult.totalContacts} contacts scanned.
+                  {mcfResult.totalConversions} first-ever conversion(s) found.
                   Showing {mcfResult.paths.length} path(s) with{" "}
                   {"\u2265"}{mcfResult.thresholdCount} conversions (
                   {mcfResult.thresholdPct}% threshold).

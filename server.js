@@ -1028,7 +1028,7 @@ app.get("/oauth/callback", async (req, res) => {
 
   const appId = process.env.HUBSPOT_APP_ID || "27714105";
   const portalId = tokens.hub_id;
-
+  
   const settingsUrl = `https://app.hubspot.com/integrations-settings/${portalId}/installed/framework/${appId}/general-settings`;
   return res.redirect(settingsUrl);
 });
@@ -1313,6 +1313,52 @@ app.post("/api/marketing-sources", async (req, res) => {
 // ================================================================
 const mcfJobStatus = {};
 
+function parseMcfWindow(startDate, endDate) {
+  const DAY_MS = 24 * 60 * 60 * 1000;
+  const MAX_RANGE_DAYS = 183; // rolling ~6 months max
+  const now = new Date();
+
+  const parsedEnd = endDate ? new Date(endDate) : now;
+  if (Number.isNaN(parsedEnd.getTime())) {
+    return { error: "Invalid endDate" };
+  }
+  const end = parsedEnd > now ? now : parsedEnd;
+
+  const parsedStart = startDate
+    ? new Date(startDate)
+    : new Date(end.getTime() - 90 * DAY_MS);
+  if (Number.isNaN(parsedStart.getTime())) {
+    return { error: "Invalid startDate" };
+  }
+  const start = parsedStart;
+
+  if (start > end) {
+    return { error: "Start date must be before end date." };
+  }
+
+  const maxRangeStart = new Date(end.getTime() - MAX_RANGE_DAYS * DAY_MS);
+  if (start < maxRangeStart) {
+    return { error: "Date range cannot exceed the last 6 months (rolling)." };
+  }
+
+  return { start, end };
+}
+
+async function getMcfConversionsForType(portalId, conversionType, start, end, jobStatus) {
+  switch (conversionType) {
+    case "form_submission":
+      return findFormSubmissionConversions(portalId, start, end, jobStatus);
+    case "meeting_booked":
+      return findMeetingBookedConversions(portalId, start, end, jobStatus);
+    case "deal_created":
+      return findDealCreatedConversions(portalId, start, end, jobStatus);
+    case "closed_won":
+      return findClosedWonConversions(portalId, start, end, jobStatus);
+    default:
+      return [];
+  }
+}
+
 /** POST /api/mcf/refresh — start a background MCF analysis job.
  *  CONVERSION-FIRST approach:
  *    1. Find conversion events in reporting period (deals/meetings/forms)
@@ -1341,37 +1387,11 @@ app.post("/api/mcf/refresh", async (req, res) => {
     return res.status(400).json({ success: false, message: `Invalid conversionType: ${conversionType}` });
   }
 
-  const DAY_MS = 24 * 60 * 60 * 1000;
-  const MAX_RANGE_DAYS = 183; // rolling ~6 months max
-  const now = new Date();
-  const parsedEnd = endDate ? new Date(endDate) : now;
-  if (Number.isNaN(parsedEnd.getTime())) {
-    return res.status(400).json({ success: false, message: "Invalid endDate" });
+  const parsedWindow = parseMcfWindow(startDate, endDate);
+  if (parsedWindow.error) {
+    return res.status(400).json({ success: false, message: parsedWindow.error });
   }
-  const end = parsedEnd > now ? now : parsedEnd;
-
-  const parsedStart = startDate
-    ? new Date(startDate)
-    : new Date(end.getTime() - 90 * DAY_MS);
-  if (Number.isNaN(parsedStart.getTime())) {
-    return res.status(400).json({ success: false, message: "Invalid startDate" });
-  }
-  const start = parsedStart;
-
-  if (start > end) {
-    return res.status(400).json({
-      success: false,
-      message: "Start date must be before end date.",
-    });
-  }
-
-  const maxRangeStart = new Date(end.getTime() - MAX_RANGE_DAYS * DAY_MS);
-  if (start < maxRangeStart) {
-    return res.status(400).json({
-      success: false,
-      message: "Date range cannot exceed the last 6 months (rolling).",
-    });
-  }
+  const { start, end } = parsedWindow;
 
   const jobKey = String(portalId);
 
@@ -1408,21 +1428,13 @@ app.post("/api/mcf/refresh", async (req, res) => {
       //   b) Extracts associated contacts
       //   c) Verifies the conversion is the FIRST EVER of that type for each contact
       //   d) Returns only qualifying { contactId, conversionTimestamp, conversionValue, currency }
-      let conversions = [];
-      switch (conversionType) {
-        case "form_submission":
-          conversions = await findFormSubmissionConversions(portalId, start, end, mcfJobStatus[jobKey]);
-          break;
-        case "meeting_booked":
-          conversions = await findMeetingBookedConversions(portalId, start, end, mcfJobStatus[jobKey]);
-          break;
-        case "deal_created":
-          conversions = await findDealCreatedConversions(portalId, start, end, mcfJobStatus[jobKey]);
-          break;
-        case "closed_won":
-          conversions = await findClosedWonConversions(portalId, start, end, mcfJobStatus[jobKey]);
-          break;
-      }
+      const conversions = await getMcfConversionsForType(
+        portalId,
+        conversionType,
+        start,
+        end,
+        mcfJobStatus[jobKey]
+      );
 
       mcfJobStatus[jobKey].converting = conversions.length;
 
@@ -1616,6 +1628,93 @@ app.get("/api/mcf/result", async (req, res) => {
     totalConversions: 0,
     message: "No results available. Run a refresh first.",
   });
+});
+
+/** POST /api/mcf/debug-conversions — returns raw detected conversions for validation.
+ *  Backend-only troubleshooting endpoint. Does not run path aggregation.
+ */
+app.post("/api/mcf/debug-conversions", async (req, res) => {
+  const portalId = req.query.portalId;
+  if (!portalId) {
+    return res.status(400).json({ success: false, message: "Missing portalId" });
+  }
+
+  const {
+    conversionType = "form_submission",
+    startDate,
+    endDate,
+    limit = 200,
+    offset = 0,
+  } = req.body || {};
+
+  const validTypes = ["form_submission", "meeting_booked", "deal_created", "closed_won"];
+  if (!validTypes.includes(conversionType)) {
+    return res.status(400).json({ success: false, message: `Invalid conversionType: ${conversionType}` });
+  }
+
+  const parsedWindow = parseMcfWindow(startDate, endDate);
+  if (parsedWindow.error) {
+    return res.status(400).json({ success: false, message: parsedWindow.error });
+  }
+  const { start, end } = parsedWindow;
+
+  const safeLimit = Math.max(1, Math.min(Number(limit) || 200, 1000));
+  const safeOffset = Math.max(0, Number(offset) || 0);
+  const debugStatus = { message: "Collecting conversions...", processed: 0, converting: 0 };
+
+  try {
+    const conversions = await getMcfConversionsForType(
+      portalId,
+      conversionType,
+      start,
+      end,
+      debugStatus
+    );
+
+    const ordered = [...conversions].sort((a, b) => {
+      return Number(a.conversionTimestamp || 0) - Number(b.conversionTimestamp || 0);
+    });
+
+    const paged = ordered.slice(safeOffset, safeOffset + safeLimit);
+    const rows = paged.map((c) => ({
+      contactId: String(c.contactId),
+      conversionTimestamp: Number(c.conversionTimestamp || 0),
+      conversionDateIso: new Date(Number(c.conversionTimestamp || 0)).toISOString(),
+      amount: Number(c.conversionValue || 0),
+      currency: c.currency || null,
+    }));
+
+    const totals = ordered.reduce(
+      (acc, c) => {
+        const amount = Number(c.conversionValue || 0);
+        acc.totalAmount += amount;
+        const cur = c.currency || "NONE";
+        acc.currencyTotals[cur] = (acc.currencyTotals[cur] || 0) + amount;
+        return acc;
+      },
+      { totalAmount: 0, currencyTotals: {} }
+    );
+
+    return res.json({
+      success: true,
+      conversionType,
+      startDate: start.toISOString(),
+      endDate: end.toISOString(),
+      detectedCount: ordered.length,
+      returnedCount: rows.length,
+      offset: safeOffset,
+      limit: safeLimit,
+      totalAmount: Math.round(totals.totalAmount * 100) / 100,
+      currencyTotals: totals.currencyTotals,
+      message: debugStatus.message || "OK",
+      conversions: rows,
+    });
+  } catch (e) {
+    return res.status(500).json({
+      success: false,
+      message: `Debug conversion query failed: ${e.message}`,
+    });
+  }
 });
 
 /** GET /api/mcf/conversion-types — returns available conversion type options. */

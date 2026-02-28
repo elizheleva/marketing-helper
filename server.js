@@ -1334,7 +1334,7 @@ app.get("/api/mcf/status", async (req, res) => {
       processed: job.processed,
       converting: job.converting || 0,
       startedAt: job.startedAt,
-      message: `Processing... ${job.processed} contacts scanned, ${job.converting || 0} conversions found.`,
+      message: job.message || `Processing... ${job.converting || 0} conversions found so far.`,
     });
   }
 
@@ -1346,9 +1346,9 @@ app.get("/api/mcf/status", async (req, res) => {
       converting: job.converting || 0,
       completedAt: job.completedAt || null,
       error: job.error || null,
-      message: job.error
+      message: job.message || (job.error
         ? `Error: ${job.error}`
-        : `Complete! ${job.processed} contacts scanned, ${job.converting || 0} conversions found.`,
+        : `Complete! ${job.converting || 0} conversions, ${job.processed} contacts processed.`),
     });
   }
 

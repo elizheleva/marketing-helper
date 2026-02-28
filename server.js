@@ -511,7 +511,13 @@ async function findFormSubmissionConversions(portalId, start, end, jobStatus) {
     if (d) {
       const ts = new Date(d).getTime();
       if (!isNaN(ts)) {
-        conversions.push({ contactId: c.id, conversionTimestamp: ts, conversionValue: 0, currency: null });
+        conversions.push({
+          objectType: "form_submission",
+          contactId: c.id,
+          conversionTimestamp: ts,
+          conversionValue: 0,
+          currency: null,
+        });
       }
     }
   }
@@ -603,6 +609,7 @@ async function findMeetingBookedConversions(portalId, start, end, jobStatus) {
 
       if (!hasEarlier) {
         conversions.push({
+          objectType: "meeting_booked",
           contactId: cId,
           conversionTimestamp: contactMap[cId],
           conversionValue: 0,
@@ -627,8 +634,8 @@ async function findMeetingBookedConversions(portalId, start, end, jobStatus) {
 // ---- DEAL CREATED (first-ever) ----
 // 1. Search deals where createdate is within reporting period
 // 2. Batch-get associated contacts for those deals
-// 3. For each contact, batch-read ALL their deals to check for earlier ones
-// 4. If no earlier deal exists → first-ever → qualifies
+// 3. For each contact, batch-read ALL their deals to determine first-ever deal
+// 4. Count each qualifying DEAL once (no duplication by contact)
 async function findDealCreatedConversions(portalId, start, end, jobStatus) {
   jobStatus.message = "Step 1/3: Searching for deals created in reporting period...";
 
@@ -643,7 +650,7 @@ async function findDealCreatedConversions(portalId, start, end, jobStatus) {
         highValue: String(end.getTime()),
       }],
     }],
-    ["createdate", "amount", "deal_currency_code"]
+    ["createdate", "amount", "deal_currency_code", "dealname"]
   );
 
   if (deals.length === 0) {
@@ -653,58 +660,55 @@ async function findDealCreatedConversions(portalId, start, end, jobStatus) {
 
   jobStatus.message = `Step 2/3: Found ${deals.length} deals. Getting associated contacts (batch)...`;
 
-  // Batch-get associations: deal → contacts
+  // Batch-get associations: deal -> contacts
   const dealIds = deals.map((d) => d.id);
   const dealAssocs = await batchGetAssociations(portalId, "deals", dealIds, "contacts");
 
-  // Build contactMap: contactId → { ts, value, currency } (keep earliest deal per contact)
-  const contactMap = {};
+  // Build contact -> all in-window deals map
+  const contactDealCandidates = {};
   for (const deal of deals) {
     const dTs = new Date(deal.properties?.createdate || deal.createdAt).getTime();
-    const dVal = parseFloat(deal.properties?.amount || "0") || 0;
-    const dCur = deal.properties?.deal_currency_code || null;
-
     const contactIds = dealAssocs[deal.id] || [];
     for (const cId of contactIds) {
-      if (!contactMap[cId] || dTs < contactMap[cId].ts) {
-        contactMap[cId] = { ts: dTs, value: dVal, currency: dCur };
-      }
+      if (!contactDealCandidates[cId]) contactDealCandidates[cId] = [];
+      contactDealCandidates[cId].push({ dealId: String(deal.id), ts: dTs });
     }
   }
 
-  const uniqueContacts = Object.keys(contactMap);
+  const uniqueContacts = Object.keys(contactDealCandidates);
   if (uniqueContacts.length === 0) {
     jobStatus.message = "No contacts associated with deals in period.";
     return [];
   }
 
-  jobStatus.message = `Step 3/3: Verifying first-ever deal for ${uniqueContacts.length} contacts...`;
+  jobStatus.message = `Step 3/3: Determining first-ever deal for ${uniqueContacts.length} contacts...`;
 
-  // For each contact, get ALL their deal IDs, then batch-read to check createdates
-  const conversions = [];
+  // For each contact, compute first-ever deal(s) by createdate
   const contactAssocs = await batchGetAssociations(portalId, "contacts", uniqueContacts, "deals");
+  const firstDealByContact = {}; // contactId -> { earliestTs, earliestDealIds:Set<string> }
 
   for (let i = 0; i < uniqueContacts.length; i++) {
     const cId = uniqueContacts[i];
     try {
       const allDealIds = contactAssocs[cId] || [];
-      // Batch-read all deals for this contact to get their createdates
       const allDeals = await batchReadObjects(portalId, "deals", allDealIds, ["createdate"]);
 
-      let hasEarlier = false;
+      let earliestTs = null;
+      const earliestDealIds = new Set();
       for (const d of allDeals) {
         const ts = new Date(d.properties?.createdate || d.createdAt).getTime();
-        if (!isNaN(ts) && ts < start.getTime()) { hasEarlier = true; break; }
+        if (Number.isNaN(ts)) continue;
+        if (earliestTs === null || ts < earliestTs) {
+          earliestTs = ts;
+          earliestDealIds.clear();
+          earliestDealIds.add(String(d.id));
+        } else if (ts === earliestTs) {
+          earliestDealIds.add(String(d.id));
+        }
       }
 
-      if (!hasEarlier) {
-        const info = contactMap[cId];
-        conversions.push({
-          contactId: cId,
-          conversionTimestamp: info.ts,
-          conversionValue: info.value,
-          currency: info.currency,
-        });
+      if (earliestTs !== null) {
+        firstDealByContact[cId] = { earliestTs, earliestDealIds };
       }
     } catch (e) {
       console.warn(`MCF: deal check error contact ${cId}:`, e.message);
@@ -716,8 +720,37 @@ async function findDealCreatedConversions(portalId, start, end, jobStatus) {
     }
   }
 
+  // Build DEAL-level conversion events (count each deal once)
+  const conversions = [];
+  for (const deal of deals) {
+    const dTs = new Date(deal.properties?.createdate || deal.createdAt).getTime();
+    const dVal = parseFloat(deal.properties?.amount || "0") || 0;
+    const dCur = deal.properties?.deal_currency_code || null;
+    const dName = deal.properties?.dealname || null;
+    const associatedContacts = dealAssocs[deal.id] || [];
+
+    const qualifyingContacts = associatedContacts.filter((cId) => {
+      const first = firstDealByContact[cId];
+      if (!first) return false;
+      if (first.earliestTs < start.getTime() || first.earliestTs > end.getTime()) return false;
+      return first.earliestDealIds.has(String(deal.id));
+    });
+
+    if (qualifyingContacts.length > 0) {
+      conversions.push({
+        objectType: "deal_created",
+        objectId: String(deal.id),
+        objectName: dName,
+        conversionTimestamp: dTs,
+        conversionValue: dVal,
+        currency: dCur,
+        associatedContactIds: qualifyingContacts,
+      });
+    }
+  }
+
   jobStatus.converting = conversions.length;
-  jobStatus.message = `Found ${conversions.length} contacts with first-ever deal in period.`;
+  jobStatus.message = `Found ${conversions.length} first-ever deal-created conversion event(s).`;
   return conversions;
 }
 
@@ -726,7 +759,7 @@ async function findDealCreatedConversions(portalId, start, end, jobStatus) {
 // 2. Verify first closed-won timestamp is within the period (dealstage history)
 // 3. Batch-get associated contacts for qualifying deals
 // 4. For each contact, check if they have any EARLIER closed-won deals
-// 5. If no earlier → first-ever → qualifies
+// 5. Count each qualifying DEAL once (no duplication by contact)
 async function findClosedWonConversions(portalId, start, end, jobStatus) {
   const closedWonStages = await getClosedWonStageIds(portalId);
   if (closedWonStages.size === 0) {
@@ -745,7 +778,7 @@ async function findClosedWonConversions(portalId, start, end, jobStatus) {
         { propertyName: "closedate", operator: "BETWEEN", value: String(start.getTime()), highValue: String(end.getTime()) },
       ],
     }],
-    ["createdate", "closedate", "amount", "deal_currency_code", "dealstage"]
+    ["createdate", "closedate", "amount", "deal_currency_code", "dealstage", "dealname"]
   );
 
   if (deals.length === 0) {
@@ -759,7 +792,7 @@ async function findClosedWonConversions(portalId, start, end, jobStatus) {
   // Need propertiesWithHistory=dealstage — batch read supports this
   const dealsWithHistory = await batchReadObjects(
     portalId, "deals", deals.map((d) => d.id),
-    ["amount", "deal_currency_code", "closedate", "dealstage"],
+    ["amount", "deal_currency_code", "closedate", "dealstage", "dealname"],
     ["dealstage"]
   );
 
@@ -779,6 +812,7 @@ async function findClosedWonConversions(portalId, start, end, jobStatus) {
     if (cwTs && cwTs >= start.getTime() && cwTs <= end.getTime()) {
       qualifyingDeals.push({
         dealId: dh.id,
+        name: dh.properties?.dealname || null,
         closedWonTs: cwTs,
         value: parseFloat(dh.properties?.amount || "0") || 0,
         currency: dh.properties?.deal_currency_code || null,
@@ -801,68 +835,61 @@ async function findClosedWonConversions(portalId, start, end, jobStatus) {
   const qualDealIds = qualifyingDeals.map((d) => d.dealId);
   const dealAssocs = await batchGetAssociations(portalId, "deals", qualDealIds, "contacts");
 
-  // Build contactMap: contactId → qualifying deal info (keep earliest closed-won per contact)
-  const contactMap = {};
+  // Build contact -> all candidate deals map
+  const contactDealCandidates = {};
   for (const qd of qualifyingDeals) {
     const contactIds = dealAssocs[qd.dealId] || [];
     for (const cId of contactIds) {
-      if (!contactMap[cId] || qd.closedWonTs < contactMap[cId].closedWonTs) {
-        contactMap[cId] = qd;
-      }
+      if (!contactDealCandidates[cId]) contactDealCandidates[cId] = [];
+      contactDealCandidates[cId].push(qd);
     }
   }
 
-  const uniqueContacts = Object.keys(contactMap);
+  const uniqueContacts = Object.keys(contactDealCandidates);
   if (uniqueContacts.length === 0) {
     jobStatus.message = "No contacts associated with qualifying closed-won deals.";
     return [];
   }
 
-  jobStatus.message = `Step 4/4: Verifying first-ever closed-won for ${uniqueContacts.length} contacts...`;
+  jobStatus.message = `Step 4/4: Determining first-ever closed-won for ${uniqueContacts.length} contacts...`;
 
-  // For each contact, check if they have any EARLIER closed-won deals
-  const conversions = [];
+  // For each contact, determine earliest closed-won deal(s)
   const contactAssocs = await batchGetAssociations(portalId, "contacts", uniqueContacts, "deals");
+  const firstClosedWonByContact = {}; // contactId -> { earliestTs, earliestDealIds:Set<string> }
 
   for (let i = 0; i < uniqueContacts.length; i++) {
     const cId = uniqueContacts[i];
-    const qd = contactMap[cId];
     try {
-      const allDealIds = (contactAssocs[cId] || []).filter((dId) => dId !== qd.dealId);
+      const allDealIds = contactAssocs[cId] || [];
+      const allDeals = await batchReadObjects(portalId, "deals", allDealIds, ["dealstage"], ["dealstage"]);
 
-      if (allDealIds.length === 0) {
-        // Only one deal — it's definitely the first-ever
-        conversions.push({
-          contactId: cId,
-          conversionTimestamp: qd.closedWonTs,
-          conversionValue: qd.value,
-          currency: qd.currency,
-        });
-        continue;
-      }
-
-      // Batch-read other deals with dealstage history
-      const otherDeals = await batchReadObjects(portalId, "deals", allDealIds, ["dealstage"], ["dealstage"]);
-
-      let hasEarlier = false;
-      for (const d of otherDeals) {
+      let earliestTs = null;
+      const earliestDealIds = new Set();
+      for (const d of allDeals) {
         const hist = d.propertiesWithHistory?.dealstage || [];
+        let dealClosedWonTs = null;
         for (const entry of hist) {
-          if (closedWonStages.has(entry.value) && Number(entry.timestamp) < start.getTime()) {
-            hasEarlier = true;
+          if (closedWonStages.has(entry.value)) {
+            dealClosedWonTs = Number(entry.timestamp);
             break;
           }
         }
-        if (hasEarlier) break;
+        if (!dealClosedWonTs && d.properties?.closedate) {
+          dealClosedWonTs = new Date(d.properties.closedate).getTime();
+        }
+        if (!dealClosedWonTs || Number.isNaN(dealClosedWonTs)) continue;
+
+        if (earliestTs === null || dealClosedWonTs < earliestTs) {
+          earliestTs = dealClosedWonTs;
+          earliestDealIds.clear();
+          earliestDealIds.add(String(d.id));
+        } else if (dealClosedWonTs === earliestTs) {
+          earliestDealIds.add(String(d.id));
+        }
       }
 
-      if (!hasEarlier) {
-        conversions.push({
-          contactId: cId,
-          conversionTimestamp: qd.closedWonTs,
-          conversionValue: qd.value,
-          currency: qd.currency,
-        });
+      if (earliestTs !== null) {
+        firstClosedWonByContact[cId] = { earliestTs, earliestDealIds };
       }
     } catch (e) {
       console.warn(`MCF: closed-won check error contact ${cId}:`, e.message);
@@ -874,8 +901,33 @@ async function findClosedWonConversions(portalId, start, end, jobStatus) {
     }
   }
 
+  // Build DEAL-level conversion events (count each deal once)
+  const conversionByDealId = {};
+  for (const qd of qualifyingDeals) {
+    const associatedContacts = dealAssocs[qd.dealId] || [];
+    const qualifyingContacts = associatedContacts.filter((cId) => {
+      const first = firstClosedWonByContact[cId];
+      if (!first) return false;
+      if (first.earliestTs < start.getTime() || first.earliestTs > end.getTime()) return false;
+      return first.earliestDealIds.has(String(qd.dealId));
+    });
+
+    if (qualifyingContacts.length > 0) {
+      conversionByDealId[String(qd.dealId)] = {
+        objectType: "closed_won",
+        objectId: String(qd.dealId),
+        objectName: qd.name || null,
+        conversionTimestamp: qd.closedWonTs,
+        conversionValue: qd.value,
+        currency: qd.currency,
+        associatedContactIds: qualifyingContacts,
+      };
+    }
+  }
+
+  const conversions = Object.values(conversionByDealId);
   jobStatus.converting = conversions.length;
-  jobStatus.message = `Found ${conversions.length} contacts with first-ever closed-won deal in period.`;
+  jobStatus.message = `Found ${conversions.length} first-ever closed-won conversion event(s).`;
   return conversions;
 }
 
@@ -1456,18 +1508,20 @@ app.post("/api/mcf/refresh", async (req, res) => {
         return;
       }
 
-      // ━━━ Phase 2: Build traffic source paths for qualifying contacts ━━━
+      // ━━━ Phase 2: Build traffic source paths ━━━
       mcfJobStatus[jobKey].message = `Building paths for ${conversions.length} qualifying conversions...`;
 
-      // Deduplicate by contactId (one contact = one first-ever conversion)
-      const contactConvMap = new Map();
+      // Gather all contact IDs needed to build paths:
+      // - contact-level events: conv.contactId
+      // - deal-level events: conv.associatedContactIds[]
+      const neededContactIdsSet = new Set();
       for (const conv of conversions) {
-        if (!contactConvMap.has(conv.contactId)) {
-          contactConvMap.set(conv.contactId, conv);
+        if (conv.contactId) neededContactIdsSet.add(String(conv.contactId));
+        for (const cId of conv.associatedContactIds || []) {
+          neededContactIdsSet.add(String(cId));
         }
       }
-
-      const uniqueContactIds = [...contactConvMap.keys()];
+      const uniqueContactIds = [...neededContactIdsSet];
 
       // Batch-read contacts with hs_latest_source history
       // (batch read supports propertiesWithHistory)
@@ -1487,35 +1541,58 @@ app.post("/api/mcf/refresh", async (req, res) => {
       const pathCounts = {};
       let pathsBuilt = 0;
 
-      for (const [contactId, conv] of contactConvMap) {
-        const sourceHistory = contactHistoryMap[contactId] || [];
-        const path = buildConversionPath(sourceHistory, conv.conversionTimestamp);
-        const key = pathToKey(path);
+      for (const conv of conversions) {
+        const contactIdsForEvent = conv.contactId
+          ? [String(conv.contactId)]
+          : (conv.associatedContactIds || []).map((id) => String(id));
 
-        if (!pathCounts[key]) {
-          pathCounts[key] = { path, conversions: 0, totalValue: 0, currencies: new Set() };
+        // Keep all contact paths, but do not duplicate conversion count/amount by contact.
+        // Each conversion event contributes total weight=1 and total value once.
+        const uniqueEventContacts = [...new Set(contactIdsForEvent)];
+        const eventWeight = uniqueEventContacts.length > 0 ? 1 / uniqueEventContacts.length : 1;
+        const eventValueWeight = (conv.conversionValue || 0) * eventWeight;
+
+        if (uniqueEventContacts.length === 0) {
+          const key = "UNKNOWN";
+          if (!pathCounts[key]) {
+            pathCounts[key] = { path: ["UNKNOWN"], conversions: 0, totalValue: 0, currencies: new Set() };
+          }
+          pathCounts[key].conversions += 1;
+          pathCounts[key].totalValue += conv.conversionValue || 0;
+          if (conv.currency) pathCounts[key].currencies.add(conv.currency);
+          continue;
         }
-        pathCounts[key].conversions++;
-        pathCounts[key].totalValue += conv.conversionValue || 0;
-        if (conv.currency) pathCounts[key].currencies.add(conv.currency);
 
-        pathsBuilt++;
-        if (pathsBuilt % 25 === 0) {
-          mcfJobStatus[jobKey].pathsBuilt = pathsBuilt;
-          mcfJobStatus[jobKey].message = `Building paths: ${pathsBuilt}/${uniqueContactIds.length} done.`;
+        for (const contactId of uniqueEventContacts) {
+          const sourceHistory = contactHistoryMap[contactId] || [];
+          const path = buildConversionPath(sourceHistory, conv.conversionTimestamp);
+          const key = pathToKey(path);
+
+          if (!pathCounts[key]) {
+            pathCounts[key] = { path, conversions: 0, totalValue: 0, currencies: new Set() };
+          }
+          pathCounts[key].conversions += eventWeight;
+          pathCounts[key].totalValue += eventValueWeight;
+          if (conv.currency) pathCounts[key].currencies.add(conv.currency);
+
+          pathsBuilt++;
+          if (pathsBuilt % 25 === 0) {
+            mcfJobStatus[jobKey].pathsBuilt = pathsBuilt;
+            mcfJobStatus[jobKey].message = `Building paths: ${pathsBuilt} contact-path evaluations done.`;
+          }
         }
       }
 
       mcfJobStatus[jobKey].pathsBuilt = pathsBuilt;
 
       // ━━━ Phase 3: Rank paths (no threshold filter) ━━━
-      const totalConversions = contactConvMap.size;
+      const totalConversions = conversions.length;
       const topPaths = Object.values(pathCounts)
         .sort((a, b) => b.conversions - a.conversions || b.totalValue - a.totalValue)
         .map((p) => ({
           path: p.path,
           pathKey: pathToKey(p.path),
-          conversions: p.conversions,
+          conversions: Math.round(p.conversions * 10000) / 10000,
           sharePct: totalConversions > 0 ? Math.round((p.conversions / totalConversions) * 10000) / 100 : 0,
           conversionValue: Math.round(p.totalValue * 100) / 100,
           currencies: [...p.currencies],
@@ -1527,7 +1604,7 @@ app.post("/api/mcf/refresh", async (req, res) => {
       const result = {
         paths: topPaths,
         totalConversions,
-        totalContacts: contactConvMap.size,
+        totalContacts: uniqueContactIds.length,
         conversionType,
         startDate: start.toISOString(),
         endDate: end.toISOString(),
@@ -1677,7 +1754,11 @@ app.post("/api/mcf/debug-conversions", async (req, res) => {
 
     const paged = ordered.slice(safeOffset, safeOffset + safeLimit);
     const rows = paged.map((c) => ({
-      contactId: String(c.contactId),
+      objectType: c.objectType || (c.contactId ? "contact_event" : "conversion_event"),
+      objectId: c.objectId || null,
+      objectName: c.objectName || null,
+      contactId: c.contactId ? String(c.contactId) : null,
+      associatedContactIds: (c.associatedContactIds || []).map((id) => String(id)),
       conversionTimestamp: Number(c.conversionTimestamp || 0),
       conversionDateIso: new Date(Number(c.conversionTimestamp || 0)).toISOString(),
       amount: Number(c.conversionValue || 0),

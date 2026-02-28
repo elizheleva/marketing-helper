@@ -252,6 +252,63 @@ console.log("\n=== 4. Aggregation Determinism ===\n");
   assert(run1["PAID_SEARCH"] === 1, "PAID_SEARCH counted once");
 }
 
+console.log("\n=== 5. Deal-Created Event Counting (No Contact Duplication) ===\n");
+
+{
+  // Simulate deal-level events where one deal is associated with multiple contacts.
+  // Expected: total conversions equals number of deals (events), not number of contacts.
+  const conversionEvents = [
+    { objectId: "deal-1", conversionValue: 100, associatedContactIds: ["c1", "c2"] },
+    { objectId: "deal-2", conversionValue: 200, associatedContactIds: ["c3"] },
+  ];
+
+  const pathByContact = {
+    c1: ["ORGANIC_SEARCH"],
+    c2: ["DIRECT_TRAFFIC"],
+    c3: ["PAID_SEARCH"],
+  };
+
+  function aggregateDealEvents(events, paths) {
+    const counts = {};
+    let totalConversions = 0;
+    let totalValue = 0;
+
+    for (const ev of events) {
+      totalConversions += 1;
+      totalValue += ev.conversionValue || 0;
+
+      const contacts = [...new Set(ev.associatedContactIds || [])];
+      const weight = contacts.length > 0 ? 1 / contacts.length : 1;
+      for (const cId of contacts) {
+        const path = paths[cId] || ["UNKNOWN"];
+        const key = pathToKey(path);
+        if (!counts[key]) counts[key] = { conversions: 0, value: 0 };
+        counts[key].conversions += weight;
+        counts[key].value += (ev.conversionValue || 0) * weight;
+      }
+    }
+
+    return { counts, totalConversions, totalValue };
+  }
+
+  const agg = aggregateDealEvents(conversionEvents, pathByContact);
+
+  assert(agg.totalConversions === 2, "Two deals -> totalConversions = 2 (not 3 contacts)");
+  assert(agg.totalValue === 300, "Total value sums once per deal");
+  assert(
+    Math.abs((agg.counts["ORGANIC_SEARCH"]?.conversions || 0) - 0.5) < 1e-9,
+    "Deal-1 is split across c1/c2: ORGANIC gets 0.5 conversion"
+  );
+  assert(
+    Math.abs((agg.counts["DIRECT_TRAFFIC"]?.conversions || 0) - 0.5) < 1e-9,
+    "Deal-1 is split across c1/c2: DIRECT gets 0.5 conversion"
+  );
+  assert(
+    Math.abs((agg.counts["PAID_SEARCH"]?.conversions || 0) - 1.0) < 1e-9,
+    "Deal-2 has one contact: PAID gets 1 conversion"
+  );
+}
+
 // ---- Summary ----
 console.log(`\n=============================`);
 console.log(`Results: ${passed} passed, ${failed} failed`);

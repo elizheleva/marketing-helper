@@ -621,7 +621,7 @@ async function findMeetingBookedConversions(portalId, start, end, jobStatus) {
     }
 
     if ((i + 1) % 10 === 0) {
-      jobStatus.message = `Step 3/3: Verified ${i + 1}/${uniqueContacts.length} contacts. ${conversions.length} qualifying so far.`;
+      jobStatus.message = `Step 3/3: Verified ${i + 1}/${uniqueContacts.length} contacts. ${Object.keys(firstDealByContact).length} contacts with first-ever candidates so far.`;
       await msDelay(100);
     }
   }
@@ -896,7 +896,7 @@ async function findClosedWonConversions(portalId, start, end, jobStatus) {
     }
 
     if ((i + 1) % 10 === 0) {
-      jobStatus.message = `Step 4/4: Verified ${i + 1}/${uniqueContacts.length} contacts. ${conversions.length} qualifying so far.`;
+      jobStatus.message = `Step 4/4: Verified ${i + 1}/${uniqueContacts.length} contacts. ${Object.keys(firstClosedWonByContact).length} contacts with first-ever candidates so far.`;
       await msDelay(100);
     }
   }

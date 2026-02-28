@@ -26,11 +26,9 @@ const CHANNEL_LABELS = {
   SOCIAL_MEDIA: "Organic Social",
   REFERRALS: "Referrals",
   OTHER_CAMPAIGNS: "Other Campaigns",
-  PAID_SOCIAL: "Paid Social",
-  DISPLAY_ADS: "Display Ads",
   DIRECT_TRAFFIC: "Direct Traffic",
   OFFLINE: "Offline Sources",
-  OTHER: "Other",
+  PAID_SOCIAL: "Paid Social",
   AI_REFERRALS: "AI Referrals",
 };
 
@@ -41,7 +39,7 @@ const CONVERSION_TYPE_OPTIONS = [
   { value: "closed_won", label: "Closed-Won Deal (first-ever)" },
 ];
 
-// All possible hs_latest_source values in HubSpot (matches native property options)
+// All possible hs_latest_source values in HubSpot (matches native property options exactly)
 const ALL_SOURCES = [
   { value: "ORGANIC_SEARCH", label: "Organic Search" },
   { value: "PAID_SEARCH", label: "Paid Search" },
@@ -49,11 +47,9 @@ const ALL_SOURCES = [
   { value: "SOCIAL_MEDIA", label: "Organic Social" },
   { value: "REFERRALS", label: "Referrals" },
   { value: "OTHER_CAMPAIGNS", label: "Other Campaigns" },
-  { value: "PAID_SOCIAL", label: "Paid Social" },
-  { value: "DISPLAY_ADS", label: "Display Ads" },
   { value: "DIRECT_TRAFFIC", label: "Direct Traffic" },
   { value: "OFFLINE", label: "Offline Sources" },
-  { value: "OTHER", label: "Other" },
+  { value: "PAID_SOCIAL", label: "Paid Social" },
   { value: "AI_REFERRALS", label: "AI Referrals" },
 ];
 
@@ -66,7 +62,6 @@ const DEFAULT_MARKETING_SOURCES = [
   "REFERRALS",
   "OTHER_CAMPAIGNS",
   "PAID_SOCIAL",
-  "DISPLAY_ADS",
 ];
 
 // ---- Portal Config (per-portal marketing source selections) ----

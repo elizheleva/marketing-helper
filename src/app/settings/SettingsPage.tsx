@@ -53,18 +53,21 @@ type McfResult = {
 
 type DateVal = { year: number; month: number; date: number };
 
+const APP_VERSION = "1.0.1";
+
 const CHANNEL_LABELS: Record<string, string> = {
   ORGANIC_SEARCH: "Organic Search",
   PAID_SEARCH: "Paid Search",
   EMAIL_MARKETING: "Email Marketing",
-  SOCIAL_MEDIA: "Social Media",
+  SOCIAL_MEDIA: "Organic Social",
   REFERRALS: "Referrals",
   OTHER_CAMPAIGNS: "Other Campaigns",
   PAID_SOCIAL: "Paid Social",
   DISPLAY_ADS: "Display Ads",
   DIRECT_TRAFFIC: "Direct Traffic",
-  OFFLINE: "Offline",
+  OFFLINE: "Offline Sources",
   OTHER: "Other",
+  AI_REFERRALS: "AI Referrals",
   UNKNOWN: "Unknown",
 };
 
@@ -80,6 +83,7 @@ const CHANNEL_TAG_VARIANT: Record<string, "default" | "success" | "warning" | "d
   DIRECT_TRAFFIC: "default",
   OFFLINE: "default",
   OTHER: "default",
+  AI_REFERRALS: "default",
   UNKNOWN: "default",
 };
 
@@ -521,7 +525,7 @@ const SettingsPage = ({ context }: AnyObj) => {
               real-time update status, and check the activity log.
             </Text>
             <Text format={{ fontSize: "small", color: "subtle" }}>
-              Powered by uspeh
+              Powered by uspeh &middot; v{APP_VERSION}
             </Text>
           </Flex>
         </Tab>
@@ -965,6 +969,11 @@ const SettingsPage = ({ context }: AnyObj) => {
           </Flex>
         </Tab>
       </Tabs>
+
+      <Divider />
+      <Text format={{ fontSize: "small", color: "subtle" }}>
+        Marketing Helper v{APP_VERSION}
+      </Text>
     </Flex>
   );
 };

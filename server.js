@@ -112,6 +112,56 @@ function saveTokenStore(store) {
   fs.writeFileSync(TOKEN_STORE_PATH, JSON.stringify(store, null, 2), "utf8");
 }
 
+function removePortalData(portalId) {
+  const key = String(portalId || "").trim();
+  if (!key) return;
+
+  // Remove OAuth tokens
+  try {
+    const tokenStore = loadTokenStore();
+    if (tokenStore[key]) {
+      delete tokenStore[key];
+      saveTokenStore(tokenStore);
+    }
+  } catch (e) {
+    console.warn(`Failed to remove token store data for portal ${key}:`, e.message);
+  }
+
+  // Remove portal-specific config
+  try {
+    const cfg = loadPortalConfig();
+    if (cfg[key]) {
+      delete cfg[key];
+      savePortalConfig(cfg);
+    }
+  } catch (e) {
+    console.warn(`Failed to remove portal config for portal ${key}:`, e.message);
+  }
+
+  // Remove in-memory job states
+  try {
+    if (jobStatus[key]) delete jobStatus[key];
+  } catch (_) { /* ignore */ }
+  try {
+    if (mcfJobStatus[key]) delete mcfJobStatus[key];
+  } catch (_) { /* ignore */ }
+
+  // Remove persisted MCF cache entries for this portal
+  try {
+    const results = loadMcfResults();
+    let changed = false;
+    for (const cacheKey of Object.keys(results)) {
+      if (cacheKey.startsWith(`${key}:`)) {
+        delete results[cacheKey];
+        changed = true;
+      }
+    }
+    if (changed) saveMcfResults(results);
+  } catch (e) {
+    console.warn(`Failed to remove MCF cache for portal ${key}:`, e.message);
+  }
+}
+
 /**
  * Get a valid access token for a portal, auto-refreshing if expired.
  */
@@ -1097,6 +1147,41 @@ app.get("/refresh", async (req, res) => {
     res.status(500).send(`Error: ${e.message}`);
   }
 });
+
+function extractPortalIdFromDeauth(req) {
+  const b = req.body || {};
+  return (
+    req.query.portalId ||
+    req.query.portal_id ||
+    req.query.hubId ||
+    req.query.hub_id ||
+    b.portalId ||
+    b.portal_id ||
+    b.hubId ||
+    b.hub_id ||
+    b.accountId ||
+    b.account_id ||
+    b.portal_id_from_scope ||
+    null
+  );
+}
+
+async function handleDeauthorize(req, res) {
+  // Always acknowledge quickly to avoid uninstall failures in HubSpot UI.
+  const portalId = extractPortalIdFromDeauth(req);
+  if (portalId) {
+    removePortalData(portalId);
+    console.log(`Deauthorize callback processed for portal ${portalId}`);
+  } else {
+    console.warn("Deauthorize callback received without portal ID");
+  }
+  return res.status(200).json({ success: true, portalId: portalId || null });
+}
+
+// Deauthorization callback for uninstall flows.
+// Configure this URL in HubSpot app settings:
+//   https://api.uspeh.co.uk/oauth/deauthorize
+app.all("/oauth/deauthorize", handleDeauthorize);
 
 // ================================================================
 // BATCH CALCULATION ENDPOINT

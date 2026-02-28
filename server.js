@@ -1334,7 +1334,6 @@ app.post("/api/mcf/refresh", async (req, res) => {
     conversionType = "form_submission",
     startDate,
     endDate,
-    thresholdPct = 10,
   } = req.body || {};
 
   const validTypes = ["form_submission", "meeting_booked", "deal_created", "closed_won"];
@@ -1342,11 +1341,37 @@ app.post("/api/mcf/refresh", async (req, res) => {
     return res.status(400).json({ success: false, message: `Invalid conversionType: ${conversionType}` });
   }
 
+  const DAY_MS = 24 * 60 * 60 * 1000;
+  const MAX_RANGE_DAYS = 183; // rolling ~6 months max
   const now = new Date();
-  const end = endDate ? new Date(endDate) : now;
-  const start = startDate
+  const parsedEnd = endDate ? new Date(endDate) : now;
+  if (Number.isNaN(parsedEnd.getTime())) {
+    return res.status(400).json({ success: false, message: "Invalid endDate" });
+  }
+  const end = parsedEnd > now ? now : parsedEnd;
+
+  const parsedStart = startDate
     ? new Date(startDate)
-    : new Date(end.getTime() - 90 * 24 * 60 * 60 * 1000);
+    : new Date(end.getTime() - 90 * DAY_MS);
+  if (Number.isNaN(parsedStart.getTime())) {
+    return res.status(400).json({ success: false, message: "Invalid startDate" });
+  }
+  const start = parsedStart;
+
+  if (start > end) {
+    return res.status(400).json({
+      success: false,
+      message: "Start date must be before end date.",
+    });
+  }
+
+  const maxRangeStart = new Date(end.getTime() - MAX_RANGE_DAYS * DAY_MS);
+  if (start < maxRangeStart) {
+    return res.status(400).json({
+      success: false,
+      message: "Date range cannot exceed the last 6 months (rolling).",
+    });
+  }
 
   const jobKey = String(portalId);
 
@@ -1368,7 +1393,6 @@ app.post("/api/mcf/refresh", async (req, res) => {
     conversionType,
     startDate: start.toISOString(),
     endDate: end.toISOString(),
-    thresholdPct,
     message: "Starting conversion-first analysis...",
   };
   res.json({ success: true, status: "started", message: "MCF analysis started (conversion-first)." });
@@ -1408,7 +1432,7 @@ app.post("/api/mcf/refresh", async (req, res) => {
         mcfJobStatus[jobKey].message = "Complete — no qualifying first-ever conversions found in the period.";
         mcfJobStatus[jobKey].result = {
           paths: [], totalConversions: 0, totalContacts: 0,
-          thresholdPct, thresholdCount: 0, conversionType,
+          conversionType,
           startDate: start.toISOString(), endDate: end.toISOString(),
           refreshedAt: new Date().toISOString(), currencies: [],
           mixedCurrencies: false, channelLabels: CHANNEL_LABELS,
@@ -1472,16 +1496,15 @@ app.post("/api/mcf/refresh", async (req, res) => {
 
       mcfJobStatus[jobKey].pathsBuilt = pathsBuilt;
 
-      // ━━━ Phase 3: Apply threshold and rank ━━━
+      // ━━━ Phase 3: Rank paths (no threshold filter) ━━━
       const totalConversions = contactConvMap.size;
-      const threshNum = Math.max(1, Math.ceil(totalConversions * (thresholdPct / 100)));
       const topPaths = Object.values(pathCounts)
-        .filter((p) => p.conversions >= threshNum)
         .sort((a, b) => b.conversions - a.conversions || b.totalValue - a.totalValue)
         .map((p) => ({
           path: p.path,
           pathKey: pathToKey(p.path),
           conversions: p.conversions,
+          sharePct: totalConversions > 0 ? Math.round((p.conversions / totalConversions) * 10000) / 100 : 0,
           conversionValue: Math.round(p.totalValue * 100) / 100,
           currencies: [...p.currencies],
         }));
@@ -1493,8 +1516,6 @@ app.post("/api/mcf/refresh", async (req, res) => {
         paths: topPaths,
         totalConversions,
         totalContacts: contactConvMap.size,
-        thresholdPct,
-        thresholdCount: threshNum,
         conversionType,
         startDate: start.toISOString(),
         endDate: end.toISOString(),
@@ -1512,9 +1533,9 @@ app.post("/api/mcf/refresh", async (req, res) => {
       mcfJobStatus[jobKey].running = false;
       mcfJobStatus[jobKey].completedAt = new Date().toISOString();
       mcfJobStatus[jobKey].result = result;
-      mcfJobStatus[jobKey].message = `Complete! ${totalConversions} first-ever conversions → ${topPaths.length} qualifying paths (threshold ≥${threshNum}).`;
+      mcfJobStatus[jobKey].message = `Complete! ${totalConversions} first-ever conversions → ${topPaths.length} path(s) ranked.`;
 
-      console.log(`MCF portal ${portalId}: DONE — ${totalConversions} conversions, ${topPaths.length} paths above threshold.`);
+      console.log(`MCF portal ${portalId}: DONE — ${totalConversions} conversions, ${topPaths.length} ranked paths.`);
     } catch (e) {
       console.error("MCF background error:", e);
       mcfJobStatus[jobKey].running = false;

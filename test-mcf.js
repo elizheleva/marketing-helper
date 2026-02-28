@@ -5,8 +5,8 @@
  *
  * Tests:
  *  1. Path collapse (consecutive duplicate removal)
- *  2. Threshold filtering
- *  3. Conversion timestamp selection (date parsing)
+ *  2. Conversion path time-bound filtering (all entries before conversion)
+ *  3. pathToKey stability
  *  4. Aggregation determinism
  */
 
@@ -199,43 +199,7 @@ console.log("\n=== 2. No Lookback Limit (all entries before conversion) ===\n");
   );
 }
 
-console.log("\n=== 3. Threshold Filtering ===\n");
-
-{
-  // Simulate threshold filtering logic
-  const pathCounts = {
-    "A>B": { conversions: 15 },
-    "C>D": { conversions: 3 },
-    "E": { conversions: 8 },
-    "F>G>H": { conversions: 1 },
-  };
-  const totalConversions = 27;
-  const thresholdPct = 10;
-  const minCount = Math.max(1, Math.ceil(totalConversions * (thresholdPct / 100)));
-
-  const qualifying = Object.entries(pathCounts)
-    .filter(([, v]) => v.conversions >= minCount)
-    .map(([k, v]) => ({ key: k, conversions: v.conversions }))
-    .sort((a, b) => b.conversions - a.conversions);
-
-  assert(minCount === 3, `10% of 27 → min count = 3 (got ${minCount})`);
-  assert(qualifying.length === 3, `3 paths qualify (A>B=15, E=8, C>D=3)`);
-  assert(
-    qualifying[0].key === "A>B" && qualifying[0].conversions === 15,
-    "Highest path is A>B with 15"
-  );
-  assert(!qualifying.find((q) => q.key === "F>G>H"), "F>G>H (1) is excluded");
-}
-
-{
-  // Edge case: 0 conversions
-  const totalConversions = 0;
-  const thresholdPct = 10;
-  const minCount = Math.max(1, Math.ceil(totalConversions * (thresholdPct / 100)));
-  assert(minCount === 1, `0 conversions → min count = 1 (floor)`);
-}
-
-console.log("\n=== 4. pathToKey ===\n");
+console.log("\n=== 3. pathToKey ===\n");
 
 {
   assertDeepEqual(
@@ -247,7 +211,7 @@ console.log("\n=== 4. pathToKey ===\n");
   assertDeepEqual(pathToKey([]), "", "Empty path → empty key");
 }
 
-console.log("\n=== 5. Aggregation Determinism ===\n");
+console.log("\n=== 4. Aggregation Determinism ===\n");
 
 {
   // Same input produces same output regardless of insertion order

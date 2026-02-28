@@ -32,6 +32,7 @@ type McfPath = {
   path: string[];
   pathKey: string;
   conversions: number;
+  sharePct?: number;
   conversionValue: number;
   currencies: string[];
 };
@@ -40,8 +41,6 @@ type McfResult = {
   paths: McfPath[];
   totalConversions: number;
   totalContacts: number;
-  thresholdPct: number;
-  thresholdCount: number;
   conversionType: string;
   startDate: string;
   endDate: string;
@@ -89,15 +88,7 @@ const CONVERSION_TYPES = [
   { label: "Deal Created (first-ever)", value: "deal_created" },
   { label: "Closed-Won Deal (first-ever)", value: "closed_won" },
 ];
-
-const THRESHOLD_OPTIONS = [
-  { label: "1%", value: "1" },
-  { label: "5%", value: "5" },
-  { label: "10% (default)", value: "10" },
-  { label: "15%", value: "15" },
-  { label: "20%", value: "20" },
-  { label: "25%", value: "25" },
-];
+const MCF_MAX_RANGE_DAYS = 183; // rolling ~6 months
 
 function toDateVal(d: Date): DateVal {
   return { year: d.getFullYear(), month: d.getMonth(), date: d.getDate() };
@@ -131,7 +122,6 @@ const SettingsPage = ({ context }: AnyObj) => {
   // --- MCF (Paths) state ---
   const now = new Date();
   const [mcfConversionType, setMcfConversionType] = useState("form_submission");
-  const [mcfThreshold, setMcfThreshold] = useState("10");
   const [mcfStartDate, setMcfStartDate] = useState<DateVal>(
     toDateVal(new Date(now.getTime() - 90 * 24 * 60 * 60 * 1000))
   );
@@ -157,14 +147,14 @@ const SettingsPage = ({ context }: AnyObj) => {
     try {
       const resp = await hubspot.fetch(
         `${BACKEND_URL}/api/marketing-sources`,
-        { method: "GET" }
-      );
+      { method: "GET" }
+    );
       const data = await resp.json();
       if (data.success) {
         setAllSources(data.allSources || []);
         setSelectedSources(data.selectedSources || []);
       }
-    } catch (e: any) {
+  } catch (e: any) {
       console.error("Failed to load sources:", e);
     } finally {
       setSourcesLoading(false);
@@ -425,6 +415,20 @@ const SettingsPage = ({ context }: AnyObj) => {
     try {
       const startD = fromDateVal(mcfStartDate);
       const endD = fromDateVal(mcfEndDate);
+      const dayMs = 24 * 60 * 60 * 1000;
+
+      if (startD > endD) {
+        setMcfRunning(false);
+        setMcfMessage("Error: Start date must be before end date.");
+        return;
+      }
+
+      const maxDays = MCF_MAX_RANGE_DAYS * dayMs;
+      if (endD.getTime() - startD.getTime() > maxDays) {
+        setMcfRunning(false);
+        setMcfMessage("Error: Date range cannot exceed the last 6 months (rolling).");
+        return;
+      }
 
       const resp = await hubspot.fetch(
         `${BACKEND_URL}/api/mcf/refresh`,
@@ -434,7 +438,6 @@ const SettingsPage = ({ context }: AnyObj) => {
             conversionType: mcfConversionType,
             startDate: startD.toISOString(),
             endDate: endD.toISOString(),
-            thresholdPct: parseInt(mcfThreshold, 10),
           },
         }
       );
@@ -555,7 +558,7 @@ const SettingsPage = ({ context }: AnyObj) => {
             </Text>
 
             {sourcesLoading ? (
-              <Text format={{ fontSize: "small", color: "subtle" }}>
+            <Text format={{ fontSize: "small", color: "subtle" }}>
                 Loading source options...
               </Text>
             ) : (
@@ -676,7 +679,8 @@ const SettingsPage = ({ context }: AnyObj) => {
               Replicates Google Analytics UA Multi-Channel Funnels &ldquo;Top
               Conversion Paths&rdquo;. Select a conversion type and date range,
               then refresh to see which traffic-source journeys lead to
-              conversions.
+              conversions. Maximum reporting window is the last 6 months
+              (rolling).
             </Text>
 
             <Divider />
@@ -715,14 +719,6 @@ const SettingsPage = ({ context }: AnyObj) => {
                 />
               </Flex>
 
-              <Select
-                label="Min Path Share (threshold)"
-                name="mcfThreshold"
-                value={mcfThreshold}
-                onChange={(val: string) => setMcfThreshold(val)}
-                options={THRESHOLD_OPTIONS}
-                description="Only show paths representing at least this % of total conversions."
-              />
             </Flex>
 
             <Flex direction="row" gap="small">
@@ -777,9 +773,7 @@ const SettingsPage = ({ context }: AnyObj) => {
               <Flex direction="column" gap="small">
                 <Text format={{ fontSize: "small" }}>
                   {mcfResult.totalConversions} first-ever conversion(s) found.
-                  Showing {mcfResult.paths.length} path(s) with{" "}
-                  {"\u2265"}{mcfResult.thresholdCount} conversions (
-                  {mcfResult.thresholdPct}% threshold).
+                  Showing {mcfResult.paths.length} ranked path(s).
                 </Text>
               </Flex>
             )}
@@ -802,6 +796,9 @@ const SettingsPage = ({ context }: AnyObj) => {
                       Conversions
                     </TableHeader>
                     <TableHeader width="min" align="right">
+                      Share
+                    </TableHeader>
+                    <TableHeader width="min" align="right">
                       Conv. Value
                     </TableHeader>
                   </TableRow>
@@ -814,6 +811,12 @@ const SettingsPage = ({ context }: AnyObj) => {
                       </TableCell>
                       <TableCell width="min" align="right">
                         {p.conversions}
+                      </TableCell>
+                      <TableCell width="min" align="right">
+                        {(p.sharePct ?? (mcfResult.totalConversions > 0
+                          ? (p.conversions / mcfResult.totalConversions) * 100
+                          : 0
+                        )).toFixed(2)}%
                       </TableCell>
                       <TableCell width="min" align="right">
                         {p.conversionValue > 0
@@ -831,6 +834,7 @@ const SettingsPage = ({ context }: AnyObj) => {
                     <TableHeader align="right">
                       {mcfResult.paths.reduce((s, p) => s + p.conversions, 0)}
                     </TableHeader>
+                    <TableHeader align="right">100%</TableHeader>
                     <TableHeader align="right">
                       {mcfResult.paths.reduce((s, p) => s + p.conversionValue, 0) > 0
                         ? mcfResult.paths
@@ -846,8 +850,8 @@ const SettingsPage = ({ context }: AnyObj) => {
             {mcfResult && mcfResult.paths.length === 0 && !mcfRunning && (
               <Flex direction="column" gap="small">
                 <Text format={{ fontSize: "small", color: "subtle" }}>
-                  No qualifying paths found. Try lowering the threshold, changing
-                  the conversion type, or expanding the date range.
+                  No paths found for this configuration. Try changing the
+                  conversion type or date range.
                 </Text>
               </Flex>
             )}

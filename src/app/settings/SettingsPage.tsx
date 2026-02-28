@@ -510,29 +510,61 @@ const SettingsPage = ({ context }: AnyObj) => {
         Marketing Helper Settings
       </Text>
 
-      <Tabs defaultSelected="sources">
+      <Tabs defaultSelected="overview">
         <Tab tabId="overview" title="Overview">
           <Flex direction="column" gap="medium">
-            <Text>
-              This app calculates the Marketing Contribution Percentage for each
-              contact. It analyses the hs_latest_source property history to
-              determine what percentage of source values came from marketing
-              channels.
+            <Text format={{ fontWeight: "bold" }}>
+              What Marketing Helper does
+            </Text>
+
+            <Text format={{ fontWeight: "demibold" }}>
+              Marketing Contribution Percentage
             </Text>
             <Text format={{ fontSize: "small" }}>
-              Use the tabs to: configure which sources count as
-              &quot;marketing&quot;, run the full database analysis, view
-              real-time update status, and check the activity log.
+              &bull; Calculates the percentage of a contact&apos;s traffic source history that came from marketing channels{"\n"}
+              &bull; You choose which HubSpot traffic sources count as &quot;marketing&quot; (e.g. Organic Search, Paid Social, Email Marketing){"\n"}
+              &bull; A custom contact property (&quot;Marketing Contribution Percentage&quot;) is created and kept up to date{"\n"}
+              &bull; Run a one-time bulk analysis across your entire database, then real-time webhooks keep every contact current as new source data arrives
             </Text>
+
+            <Divider />
+
+            <Text format={{ fontWeight: "demibold" }}>
+              Conversion Paths (MCF)
+            </Text>
+            <Text format={{ fontSize: "small" }}>
+              &bull; Inspired by Google Analytics UA &quot;Top Conversion Paths&quot; report{"\n"}
+              &bull; Pick a conversion type (Form submission, Meeting booked, Deal created, or Closed-won deal) and a date range{"\n"}
+              &bull; The app finds every first-ever conversion in that period, reconstructs the contact&apos;s full traffic-source journey leading up to it, and groups the results into ranked paths{"\n"}
+              &bull; Paths are displayed as pill-style channel labels with conversion counts and values
+            </Text>
+
+            <Divider />
+
+            <Text format={{ fontWeight: "demibold" }}>
+              How to get started
+            </Text>
+            <Text format={{ fontSize: "small" }}>
+              1. Go to the Data Analysis tab and select which traffic sources you consider &quot;marketing&quot;, then save{"\n"}
+              2. Click &quot;Run Full Analysis&quot; to calculate the Marketing Contribution Percentage for all existing contacts{"\n"}
+              3. Real-time webhooks will automatically recalculate whenever a contact&apos;s traffic source changes{"\n"}
+              4. Use the Paths (MCF) tab to explore conversion journeys for any time period
+            </Text>
+
+            <Divider />
             <Text format={{ fontSize: "small", color: "subtle" }}>
               Powered by uspeh &middot; v{APP_VERSION}
             </Text>
           </Flex>
         </Tab>
 
-        <Tab tabId="sources" title="Configure Sources">
+        <Tab tabId="analysis" title="Data Analysis">
           <Flex direction="column" gap="large">
-            <Text>
+            {/* ---- Configure Sources section ---- */}
+            <Text format={{ fontWeight: "bold" }}>
+              Configure Marketing Sources
+            </Text>
+            <Text format={{ fontSize: "small" }}>
               Select which traffic sources should be counted as
               &quot;marketing&quot; when calculating the Marketing Contribution
               Percentage. Any source not selected will be treated as
@@ -586,29 +618,17 @@ const SettingsPage = ({ context }: AnyObj) => {
 
             <Divider />
 
-            <Text format={{ fontSize: "small", color: "subtle" }}>
-              After saving, click &quot;Run Full Analysis&quot; on the Run
-              Analysis tab to recalculate all contacts with the new settings.
-              Future webhook updates will also use the new configuration.
+            {/* ---- Run Analysis section ---- */}
+            <Text format={{ fontWeight: "bold" }}>
+              Run Full Analysis
             </Text>
-          </Flex>
-        </Tab>
-
-        <Tab tabId="actions" title="Run Analysis">
-          <Flex direction="column" gap="large">
-            <Text>
-              Run a full analysis across your entire contact database. The
-              system processes all contacts in the background — you can
-              navigate away and come back to check progress.
-            </Text>
-
             <Text format={{ fontSize: "small" }}>
-              This will:{"\n"}&bull; Create the &quot;Marketing Contribution
-              Percentage&quot; property (if it doesn&apos;t exist){"\n"}&bull;
-              Read each contact&apos;s full hs_latest_source property history
-              {"\n"}&bull; Calculate the % based on your configured marketing
-              sources{"\n"}&bull; Update each contact with the calculated
-              percentage
+              Processes every contact in the background. You can navigate away
+              and return to check progress. The analysis will:{"\n"}
+              &bull; Create the &quot;Marketing Contribution Percentage&quot; property if it doesn&apos;t exist{"\n"}
+              &bull; Read each contact&apos;s full hs_latest_source history{"\n"}
+              &bull; Calculate the percentage based on your selected marketing sources above{"\n"}
+              &bull; Update each contact with the result
             </Text>
 
             {!analysisAllowed && !analysisRunning && (
@@ -616,7 +636,7 @@ const SettingsPage = ({ context }: AnyObj) => {
                 <Tag variant="default">Up to date</Tag>
                 <Text format={{ fontSize: "small" }}>
                   Analysis has been run with the current source settings.
-                  Change your marketing source configuration to run again.
+                  Change your marketing source configuration above and save to run again.
                 </Text>
               </Flex>
             )}
@@ -653,42 +673,21 @@ const SettingsPage = ({ context }: AnyObj) => {
                 {analysisMessage}
               </Text>
             )}
-          </Flex>
-        </Tab>
 
-        <Tab tabId="realtime" title="Real-Time Updates">
-          <Flex direction="column" gap="large">
+            <Divider />
+
+            {/* ---- Real-time updates info ---- */}
             <Flex direction="row" gap="small">
               <Tag variant="success">Active</Tag>
               <Text format={{ fontWeight: "bold" }}>
-                Real-time webhook is enabled
+                Real-time updates enabled
               </Text>
             </Flex>
-
-            <Text>
-              The app listens for changes to the hs_latest_source property on
-              contacts. When a contact&apos;s traffic source changes, the
-              Marketing Contribution Percentage is automatically recalculated
-              using your current marketing source configuration.
-            </Text>
-
-            <Divider />
-
-            <Text format={{ fontWeight: "bold" }}>How it works:</Text>
             <Text format={{ fontSize: "small" }}>
-              1. HubSpot detects a change to hs_latest_source on a contact
-              {"\n"}2. A webhook event is sent to the server{"\n"}3. The server
-              fetches the contact&apos;s full source history{"\n"}4. It
-              recalculates using your configured marketing sources{"\n"}5. The
-              contact&apos;s property is updated automatically
-            </Text>
-
-            <Divider />
-
-            <Text format={{ fontSize: "small", color: "subtle" }}>
-              Tip: Configure your marketing sources first, then run the Full
-              Analysis to set initial values. The webhook keeps everything up
-              to date going forward.
+              A webhook automatically recalculates the Marketing Contribution
+              Percentage whenever a contact&apos;s hs_latest_source changes.
+              No action required — once you&apos;ve configured your sources
+              and run the initial analysis, everything stays up to date.
             </Text>
           </Flex>
         </Tab>

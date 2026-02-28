@@ -7,7 +7,7 @@ import {
   Tab,
   Divider,
   Tag,
-  Checkbox,
+  MultiSelect,
   Table,
   TableHead,
   TableRow,
@@ -297,19 +297,6 @@ const SettingsPage = ({ context }: AnyObj) => {
   };
 
   /**
-   * Toggle a source on/off.
-   */
-  const toggleSource = (sourceValue: string, checked: boolean) => {
-    setSelectedSources((prev) => {
-      if (checked) {
-        return [...prev, sourceValue];
-      } else {
-        return prev.filter((s) => s !== sourceValue);
-      }
-    });
-  };
-
-  /**
    * Save the selected marketing sources.
    */
   const saveSources = async () => {
@@ -572,33 +559,24 @@ const SettingsPage = ({ context }: AnyObj) => {
                 Loading source options...
               </Text>
             ) : (
-              <Flex direction="column" gap="small">
-                {allSources.map((source) => (
-                  <Checkbox
-                    key={source.value}
-                    checked={selectedSources.includes(source.value)}
-                    onChange={(checked: boolean) =>
-                      toggleSource(source.value, checked)
-                    }
-                  >
-                    {source.label}
-                  </Checkbox>
-                ))}
-              </Flex>
+              <MultiSelect
+                label="Marketing sources"
+                name="marketingSources"
+                placeholder="Select sources to count as marketing..."
+                value={selectedSources}
+                onChange={(values: string[]) => setSelectedSources(values)}
+                options={allSources}
+                description={`${selectedSources.length} of ${allSources.length} sources selected as marketing`}
+              />
             )}
 
-            <Flex direction="row" gap="small">
-              <Button
-                onClick={saveSources}
-                disabled={sourcesSaving || sourcesLoading}
-                variant="primary"
-              >
-                {sourcesSaving ? "Saving..." : "Save Source Settings"}
-              </Button>
-              <Text format={{ fontSize: "small", color: "subtle" }}>
-                {selectedSources.length} source(s) selected as marketing
-              </Text>
-            </Flex>
+            <Button
+              onClick={saveSources}
+              disabled={sourcesSaving || sourcesLoading}
+              variant="primary"
+            >
+              {sourcesSaving ? "Saving..." : "Save Source Settings"}
+            </Button>
 
             {sourcesMessage && (
               <Text
@@ -684,86 +662,6 @@ const SettingsPage = ({ context }: AnyObj) => {
               Percentage whenever a contact&apos;s hs_latest_source changes.
               No action required — once you&apos;ve configured your sources
               and run the initial analysis, everything stays up to date.
-            </Text>
-          </Flex>
-        </Tab>
-
-        <Tab tabId="log" title="Activity Log">
-          <Flex direction="column" gap="large">
-            <Text format={{ fontWeight: "bold" }}>Activity Log</Text>
-
-            <Flex direction="column" gap="medium">
-              <Flex direction="column" gap="extra-small">
-                <Text format={{ fontWeight: "bold", fontSize: "small" }}>
-                  Last source configuration change
-                </Text>
-                <Text>
-                  {lastSourcesUpdated
-                    ? formatTimestamp(lastSourcesUpdated)
-                    : "Never (using default sources)"}
-                </Text>
-              </Flex>
-
-              <Divider />
-
-              <Flex direction="column" gap="extra-small">
-                <Text format={{ fontWeight: "bold", fontSize: "small" }}>
-                  Last full analysis run
-                </Text>
-                <Text>
-                  {lastAnalysisRun
-                    ? formatTimestamp(lastAnalysisRun)
-                    : "Never"}
-                </Text>
-                {statusInfo &&
-                  (statusInfo.status === "completed" ||
-                    statusInfo.lastAnalysisRun) && (
-                    <Text format={{ fontSize: "small", color: "subtle" }}>
-                      Processed: {statusInfo.processed || 0} &middot; Updated:{" "}
-                      {statusInfo.updated || 0} &middot; Zero-history:{" "}
-                      {statusInfo.skippedNoHistory || 0} &middot; Failed:{" "}
-                      {statusInfo.failed || 0}
-                    </Text>
-                  )}
-              </Flex>
-
-              <Divider />
-
-              <Flex direction="column" gap="extra-small">
-                <Text format={{ fontWeight: "bold", fontSize: "small" }}>
-                  Current status
-                </Text>
-                {analysisRunning ? (
-                  <Flex direction="row" gap="small">
-                    <Tag variant="warning">Running</Tag>
-                    <Text>
-                      {statusInfo?.processed || 0} contacts processed
-                    </Text>
-                  </Flex>
-                ) : analysisAllowed ? (
-                  <Flex direction="row" gap="small">
-                    <Tag variant="default">Pending</Tag>
-                    <Text>
-                      Source configuration has changed — analysis available
-                    </Text>
-                  </Flex>
-                ) : (
-                  <Flex direction="row" gap="small">
-                    <Tag variant="success">Up to date</Tag>
-                    <Text>
-                      Analysis matches current source configuration
-                    </Text>
-                  </Flex>
-                )}
-              </Flex>
-            </Flex>
-
-            <Divider />
-
-            <Text format={{ fontSize: "small", color: "subtle" }}>
-              Note: Changing the marketing source configuration may impact
-              reporting. The timestamp above records when the configuration
-              was last modified so you can track any reporting changes.
             </Text>
           </Flex>
         </Tab>
@@ -961,6 +859,86 @@ const SettingsPage = ({ context }: AnyObj) => {
                 contacts&rsquo; conversion journeys.
               </Text>
             )}
+          </Flex>
+        </Tab>
+
+        <Tab tabId="log" title="Activity Log">
+          <Flex direction="column" gap="large">
+            <Text format={{ fontWeight: "bold" }}>Activity Log</Text>
+
+            <Flex direction="column" gap="medium">
+              <Flex direction="column" gap="extra-small">
+                <Text format={{ fontWeight: "bold", fontSize: "small" }}>
+                  Last source configuration change
+                </Text>
+                <Text>
+                  {lastSourcesUpdated
+                    ? formatTimestamp(lastSourcesUpdated)
+                    : "Never (using default sources)"}
+                </Text>
+              </Flex>
+
+              <Divider />
+
+              <Flex direction="column" gap="extra-small">
+                <Text format={{ fontWeight: "bold", fontSize: "small" }}>
+                  Last full analysis run
+                </Text>
+                <Text>
+                  {lastAnalysisRun
+                    ? formatTimestamp(lastAnalysisRun)
+                    : "Never"}
+                </Text>
+                {statusInfo &&
+                  (statusInfo.status === "completed" ||
+                    statusInfo.lastAnalysisRun) && (
+                    <Text format={{ fontSize: "small", color: "subtle" }}>
+                      Processed: {statusInfo.processed || 0} &middot; Updated:{" "}
+                      {statusInfo.updated || 0} &middot; Zero-history:{" "}
+                      {statusInfo.skippedNoHistory || 0} &middot; Failed:{" "}
+                      {statusInfo.failed || 0}
+                    </Text>
+                  )}
+              </Flex>
+
+              <Divider />
+
+              <Flex direction="column" gap="extra-small">
+                <Text format={{ fontWeight: "bold", fontSize: "small" }}>
+                  Current status
+                </Text>
+                {analysisRunning ? (
+                  <Flex direction="row" gap="small">
+                    <Tag variant="warning">Running</Tag>
+                    <Text>
+                      {statusInfo?.processed || 0} contacts processed
+                    </Text>
+                  </Flex>
+                ) : analysisAllowed ? (
+                  <Flex direction="row" gap="small">
+                    <Tag variant="default">Pending</Tag>
+                    <Text>
+                      Source configuration has changed — analysis available
+                    </Text>
+                  </Flex>
+                ) : (
+                  <Flex direction="row" gap="small">
+                    <Tag variant="success">Up to date</Tag>
+                    <Text>
+                      Analysis matches current source configuration
+                    </Text>
+                  </Flex>
+                )}
+              </Flex>
+            </Flex>
+
+            <Divider />
+
+            <Text format={{ fontSize: "small", color: "subtle" }}>
+              Note: Changing the marketing source configuration may impact
+              reporting. The timestamp above records when the configuration
+              was last modified so you can track any reporting changes.
+            </Text>
           </Flex>
         </Tab>
       </Tabs>

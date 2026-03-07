@@ -985,13 +985,56 @@ async function findClosedWonConversions(portalId, start, end, jobStatus) {
  * Ensure the marketing_contribution_percentage property exists.
  */
 async function ensurePropertyExists(portalId) {
+  const propertyDefinition = {
+    name: PROPERTY_NAME,
+    label: "Marketing Contribution Percentage",
+    description:
+      "Percentage of hs_latest_source history changes attributed to marketing sources.",
+    groupName: "contactinformation",
+    type: "number",
+    fieldType: "number",
+    numberDisplayHint: "percentage",
+    hidden: false,
+    formField: false,
+    displayOrder: -1,
+  };
+
   try {
-    await hubspotApi(
+    const existing = await hubspotApi(
       portalId,
       `https://api.hubapi.com/crm/v3/properties/contacts/${PROPERTY_NAME}`,
       { method: "GET" }
     );
-    return false; // already exists
+
+    // Keep legacy portals in sync: ensure this property is number + percentage display.
+    const needsUpdate =
+      existing?.type !== "number" ||
+      existing?.fieldType !== "number" ||
+      existing?.numberDisplayHint !== "percentage";
+
+    if (needsUpdate) {
+      await hubspotApi(
+        portalId,
+        `https://api.hubapi.com/crm/v3/properties/contacts/${PROPERTY_NAME}`,
+        {
+          method: "PATCH",
+          body: JSON.stringify({
+            label: propertyDefinition.label,
+            description: propertyDefinition.description,
+            groupName: propertyDefinition.groupName,
+            type: propertyDefinition.type,
+            fieldType: propertyDefinition.fieldType,
+            numberDisplayHint: propertyDefinition.numberDisplayHint,
+            hidden: propertyDefinition.hidden,
+            formField: propertyDefinition.formField,
+            displayOrder: propertyDefinition.displayOrder,
+          }),
+        }
+      );
+      return "updated";
+    }
+
+    return false; // already exists and has expected settings
   } catch (e) {
     if (e?.status !== 404) throw e;
   }
@@ -1001,18 +1044,7 @@ async function ensurePropertyExists(portalId) {
     "https://api.hubapi.com/crm/v3/properties/contacts",
     {
       method: "POST",
-      body: JSON.stringify({
-        name: PROPERTY_NAME,
-        label: "Marketing Contribution Percentage",
-        description:
-          "Percentage of hs_latest_source history changes attributed to marketing sources.",
-        groupName: "contactinformation",
-        type: "number",
-        fieldType: "number",
-        hidden: false,
-        formField: false,
-        displayOrder: -1,
-      }),
+      body: JSON.stringify(propertyDefinition),
     }
   );
   return true; // created

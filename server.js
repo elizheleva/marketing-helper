@@ -1458,6 +1458,30 @@ app.get("/api/mcf/status", async (req, res) => {
   });
 });
 
+/** POST /api/mcf/clear-cache — clear cached MCF results for a portal so a fresh run is forced. */
+app.post("/api/mcf/clear-cache", async (req, res) => {
+  const portalId = req.query.portalId || req.body?.portalId;
+  if (!portalId) {
+    return res.status(400).json({ success: false, message: "Missing portalId" });
+  }
+  const key = String(portalId);
+  // Clear in-memory result
+  if (mcfJobStatus[key]) {
+    delete mcfJobStatus[key].result;
+  }
+  // Clear persisted cache for this portal (all conversion types)
+  const allResults = loadMcfResults();
+  let changed = false;
+  for (const k of Object.keys(allResults)) {
+    if (k.startsWith(`${key}:`)) {
+      delete allResults[k];
+      changed = true;
+    }
+  }
+  if (changed) saveMcfResults(allResults);
+  return res.json({ success: true, message: "MCF cache cleared. Run a fresh analysis." });
+});
+
 /** GET /api/mcf/result — fetch cached MCF results. */
 app.get("/api/mcf/result", async (req, res) => {
   const portalId = req.query.portalId;

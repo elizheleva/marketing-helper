@@ -740,13 +740,38 @@ const SettingsPage = ({ context }: AnyObj) => {
               />
             </Flex>
 
-            <Button
-              onClick={startMcfRefresh}
-              disabled={mcfRunning || portalId == null}
-              variant="primary"
-            >
-              {mcfRunning ? "Running..." : "Run"}
-            </Button>
+            <Flex direction="row" gap="small">
+              <Button
+                onClick={startMcfRefresh}
+                disabled={mcfRunning || portalId == null}
+                variant="primary"
+              >
+                {mcfRunning ? "Running..." : "Run"}
+              </Button>
+              <Button
+                onClick={async () => {
+                  if (portalId == null) return;
+                  try {
+                    const r = await hubspot.fetch(
+                      `${BACKEND_URL}/api/mcf/clear-cache?portalId=${portalId}`,
+                      { method: "POST" }
+                    );
+                    const d = await r.json();
+                    if (d.success) {
+                      setMcfResult(null);
+                      setMcfMessage("Cache cleared. Click Run to re-analyze.");
+                      loadMcfResult();
+                    }
+                  } catch (e: any) {
+                    setMcfMessage(`Error: ${e?.message || "Failed to clear cache"}`);
+                  }
+                }}
+                disabled={mcfRunning || portalId == null}
+                variant="secondary"
+              >
+                Clear cache
+              </Button>
+            </Flex>
 
             {mcfRunning && (
               <Flex direction="row" gap="small">

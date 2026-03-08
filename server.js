@@ -1,5 +1,7 @@
 // server.js
 // HubSpot OAuth installer + Marketing Contribution backend
+// BACKEND_VERSION: bump when deploying (no legacy firstDealByContact)
+const BACKEND_VERSION = "1.1.6";
 
 const express = require("express");
 const fs = require("fs");
@@ -720,6 +722,11 @@ async function processContact(portalId, contactId) {
 // Health check
 app.get("/", (_req, res) => {
   res.send("Server is running ✅");
+});
+
+// Version check (verify deployed code after updates)
+app.get("/api/version", (_req, res) => {
+  res.json({ version: BACKEND_VERSION });
 });
 
 // Install route: redirects to HubSpot OAuth consent

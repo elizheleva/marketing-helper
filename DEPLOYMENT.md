@@ -77,3 +77,60 @@ https://app.hubspot.com/integrations-settings/{portalId}/installed/framework/{ap
 Where:
 - `portalId` is dynamically extracted from the OAuth token response
 - `appId` is set via `HUBSPOT_APP_ID` environment variable (default: "27714105")
+
+---
+
+## VPS Deployment (api.uspeh.co.uk)
+
+The backend runs on a VPS (46.202.194.179) with Docker Compose. Use Git-based deployment for easy updates.
+
+### One-time setup on the VPS
+
+1. SSH to the server:
+   ```bash
+   ssh root@46.202.194.179
+   ```
+
+2. If `/root/express-api` already exists with old files, back it up and replace with the repo:
+   ```bash
+   cd /root
+   # If you have existing express-api, rename it:
+   mv express-api express-api.bak
+   git clone https://github.com/elizheleva/marketing-helper.git express-api
+   ```
+
+3. Ensure your `docker-compose.yml` at `/root/docker-compose.yml` has an `express-api` service with build context pointing to `./express-api`:
+   ```yaml
+   express-api:
+     build:
+       context: ./express-api
+       dockerfile: Dockerfile
+     # ... rest of your config (env, volumes, etc.)
+   ```
+
+4. Make the deploy script executable:
+   ```bash
+   chmod +x /root/express-api/deploy.sh
+   ```
+
+### Deploying updates
+
+**Option A – From your local machine (one command):**
+
+```powershell
+ssh root@46.202.194.179 "cd /root/express-api && ./deploy.sh"
+```
+
+**Option B – From the server:**
+
+```bash
+ssh root@46.202.194.179
+cd /root/express-api
+./deploy.sh
+```
+
+**Workflow:** Push to GitHub → run the deploy command above → done.
+
+### Verify deployment
+
+Open https://api.uspeh.co.uk/api/version in a browser. You should see `{"version":"1.1.6"}` (or whatever version is in `server.js`).

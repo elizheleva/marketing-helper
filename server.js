@@ -1,7 +1,7 @@
 // server.js
 // HubSpot OAuth installer + Marketing Contribution backend
 // BACKEND_VERSION: bump when deploying (no legacy firstDealByContact)
-const BACKEND_VERSION = "1.1.6";
+const BACKEND_VERSION = "1.1.7";
 
 const express = require("express");
 const fs = require("fs");
@@ -1272,22 +1272,28 @@ app.post("/api/mcf/refresh", async (req, res) => {
       }
       const uniqueContactIds = [...neededContactIdsSet];
 
-      // Batch-read contacts with hs_latest_source history
-      // (batch read supports propertiesWithHistory)
+      // Batch-read contacts with hs_latest_source history + display props
       const contactsWithHistory = await batchReadObjects(
         portalId, "contacts", uniqueContactIds,
-        ["hs_latest_source"],
+        ["hs_latest_source", "email", "firstname", "lastname"],
         ["hs_latest_source"]
       );
 
       // Index by ID for fast lookup
       const contactHistoryMap = {};
+      const contactDisplayMap = {};
       for (const c of contactsWithHistory) {
         contactHistoryMap[c.id] = c.propertiesWithHistory?.hs_latest_source || [];
+        contactDisplayMap[c.id] = {
+          email: c.properties?.email || "",
+          firstname: c.properties?.firstname || "",
+          lastname: c.properties?.lastname || "",
+        };
       }
 
-      // Build paths and aggregate
+      // Build paths and aggregate; track eligible contacts per path
       const pathCounts = {};
+      const eligibleContacts = [];
       let pathsBuilt = 0;
 
       for (const conv of conversions) {
@@ -1324,6 +1330,16 @@ app.post("/api/mcf/refresh", async (req, res) => {
           pathCounts[key].totalValue += eventValueWeight;
           if (conv.currency) pathCounts[key].currencies.add(conv.currency);
 
+          const disp = contactDisplayMap[contactId] || {};
+          eligibleContacts.push({
+            contactId,
+            pathKey: key,
+            conversionTimestamp: conv.conversionTimestamp,
+            email: disp.email || "",
+            firstname: disp.firstname || "",
+            lastname: disp.lastname || "",
+          });
+
           pathsBuilt++;
           if (pathsBuilt % 25 === 0) {
             mcfJobStatus[jobKey].pathsBuilt = pathsBuilt;
@@ -1352,6 +1368,7 @@ app.post("/api/mcf/refresh", async (req, res) => {
 
       const result = {
         paths: topPaths,
+        eligibleContacts,
         totalConversions,
         totalContacts: uniqueContactIds.length,
         conversionType,

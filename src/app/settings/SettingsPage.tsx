@@ -17,6 +17,7 @@ import {
   TableFooter,
   Select,
   DateInput,
+  Link,
 } from "@hubspot/ui-extensions";
 import { hubspot } from "@hubspot/ui-extensions";
 
@@ -37,8 +38,18 @@ type McfPath = {
   currencies: string[];
 };
 
+type McfEligibleContact = {
+  contactId: string;
+  pathKey: string;
+  conversionTimestamp?: number;
+  email: string;
+  firstname: string;
+  lastname: string;
+};
+
 type McfResult = {
   paths: McfPath[];
+  eligibleContacts?: McfEligibleContact[];
   totalConversions: number;
   totalContacts: number;
   conversionType: string;
@@ -52,7 +63,7 @@ type McfResult = {
 
 type DateVal = { year: number; month: number; date: number };
 
-const APP_VERSION = "1.1.5";
+const APP_VERSION = "1.1.7";
 
 const CHANNEL_LABELS: Record<string, string> = {
   ORGANIC_SEARCH: "Organic Search",
@@ -813,6 +824,55 @@ const SettingsPage = ({ context }: AnyObj) => {
                   <Text format={{ fontSize: "small", color: "subtle" }}>
                     No eligible first-ever meetings found in this timeframe.
                   </Text>
+                )}
+
+                {mcfResult.eligibleContacts && mcfResult.eligibleContacts.length > 0 && (
+                  <>
+                    <Divider />
+                    <Text format={{ fontWeight: "bold", fontSize: "small" }}>
+                      Eligible contacts ({mcfResult.eligibleContacts.length})
+                    </Text>
+                    <Table bordered={true} paginated={mcfResult.eligibleContacts.length > 10} pageCount={Math.ceil(mcfResult.eligibleContacts.length / 10)}>
+                      <TableHead>
+                        <TableRow>
+                          <TableHeader width="max">Contact</TableHeader>
+                          <TableHeader width="max">Traffic source path</TableHeader>
+                          <TableHeader width="min">Open</TableHeader>
+                        </TableRow>
+                      </TableHead>
+                      <TableBody>
+                        {mcfResult.eligibleContacts.map((c, idx) => {
+                          const displayName = [c.firstname, c.lastname].filter(Boolean).join(" ") || c.email || `Contact ${c.contactId}`;
+                          const path = mcfResult.paths.find((p) => p.pathKey === c.pathKey);
+                          const contactUrl = portalId
+                            ? `https://app.hubspot.com/contacts/${portalId}/contact/${c.contactId}`
+                            : "#";
+                          return (
+                            <TableRow key={`${c.contactId}-${idx}`}>
+                              <TableCell width="max">
+                                <Text format={{ fontSize: "small" }}>{displayName}</Text>
+                                {c.email && (
+                                  <Text format={{ fontSize: "xsmall", color: "subtle" }}>{c.email}</Text>
+                                )}
+                              </TableCell>
+                              <TableCell width="max">
+                                {path ? renderPathPills(path.path) : <Text format={{ fontSize: "small", color: "subtle" }}>{c.pathKey}</Text>}
+                              </TableCell>
+                              <TableCell width="min">
+                                {portalId && (
+                                  <Link
+                                    href={{ url: contactUrl, external: true }}
+                                  >
+                                    View in HubSpot
+                                  </Link>
+                                )}
+                              </TableCell>
+                            </TableRow>
+                          );
+                        })}
+                      </TableBody>
+                    </Table>
+                  </>
                 )}
               </>
             )}

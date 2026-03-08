@@ -63,7 +63,7 @@ type McfResult = {
 
 type DateVal = { year: number; month: number; date: number };
 
-const APP_VERSION = "1.1.8";
+const APP_VERSION = "1.1.9";
 
 const CHANNEL_LABELS: Record<string, string> = {
   ORGANIC_SEARCH: "Organic Search",
@@ -756,11 +756,26 @@ const SettingsPage = ({ context }: AnyObj) => {
                       `${BACKEND_URL}/api/mcf/clear-cache?portalId=${portalId}`,
                       { method: "POST" }
                     );
-                    const d = await r.json();
+                    const text = await r.text();
+                    let d: { success?: boolean; message?: string } = {};
+                    if (text) {
+                      try {
+                        d = JSON.parse(text);
+                      } catch {
+                        setMcfMessage(`Error: Backend returned invalid response. Ensure the API is deployed.`);
+                        return;
+                      }
+                    }
+                    if (!r.ok) {
+                      setMcfMessage(`Error: ${d.message || `Request failed (${r.status})`}`);
+                      return;
+                    }
                     if (d.success) {
                       setMcfResult(null);
                       setMcfMessage("Cache cleared. Click Run to re-analyze.");
                       loadMcfResult();
+                    } else {
+                      setMcfMessage(d.message || "Clear cache failed.");
                     }
                   } catch (e: any) {
                     setMcfMessage(`Error: ${e?.message || "Failed to clear cache"}`);

@@ -1,7 +1,7 @@
 // server.js
 // HubSpot OAuth installer + Marketing Contribution backend
 // BACKEND_VERSION: bump when deploying (no legacy firstDealByContact)
-const BACKEND_VERSION = "1.1.8";
+const BACKEND_VERSION = "1.1.9";
 
 const express = require("express");
 const fs = require("fs");
@@ -326,19 +326,29 @@ function msDelay(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
+/** Parse timestamp from HubSpot (ISO string or ms number) to milliseconds. */
+function parseHistoryTimestamp(val) {
+  if (val == null || val === "") return 0;
+  if (typeof val === "number" && !isNaN(val)) return val;
+  const d = new Date(val);
+  return isNaN(d.getTime()) ? 0 : d.getTime();
+}
+
 /**
  * Build a conversion path from hs_latest_source history.
  * Includes ALL entries before the conversion timestamp (no lookback limit).
  * This captures the full journey leading to conversion.
  * Collapses consecutive duplicate sources.
+ * HubSpot returns timestamps as ISO strings; must parse before comparing.
  */
 function buildConversionPath(sourceHistory, conversionTimestamp) {
+  const convTs = typeof conversionTimestamp === "number" ? conversionTimestamp : parseHistoryTimestamp(conversionTimestamp);
   const entries = (sourceHistory || [])
     .filter((e) => {
-      const ts = Number(e.timestamp || 0);
-      return ts > 0 && ts <= conversionTimestamp;
+      const ts = parseHistoryTimestamp(e.timestamp);
+      return ts > 0 && ts <= convTs;
     })
-    .sort((a, b) => Number(a.timestamp || 0) - Number(b.timestamp || 0));
+    .sort((a, b) => parseHistoryTimestamp(a.timestamp) - parseHistoryTimestamp(b.timestamp));
 
   if (entries.length === 0) return ["UNKNOWN"];
 

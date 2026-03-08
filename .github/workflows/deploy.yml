@@ -20,7 +20,13 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Upload to HubSpot
-        uses: HubSpot/hubspot-project-actions@v1.1.0
+        id: upload
+        uses: HubSpot/hubspot-project-actions/project-upload@v1.1.0
+
+      - name: Deploy to HubSpot
+        uses: HubSpot/hubspot-project-actions/project-deploy@v1.1.0
+        with:
+          build_id: ${{ steps.upload.outputs.build_id }}
 
   deploy-vps:
     name: Deploy to VPS (Backend)

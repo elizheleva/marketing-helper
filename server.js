@@ -1563,6 +1563,157 @@ app.post("/api/mcf/debug-conversions", async (req, res) => {
   }
 });
 
+/** POST /api/mcf/debug-contact — trace why specific contacts were excluded from MCF.
+ *  Body: { contactIds: string[], startDate?, endDate? }
+ *  Uses same date range as last MCF run if not provided, or last 90 days.
+ */
+app.post("/api/mcf/debug-contact", async (req, res) => {
+  const portalId = req.query.portalId;
+  if (!portalId) {
+    return res.status(400).json({ success: false, message: "Missing portalId" });
+  }
+
+  const { contactIds = [] } = req.body || {};
+  const ids = Array.isArray(contactIds) ? contactIds.map(String).filter(Boolean) : [];
+  if (ids.length === 0) {
+    return res.status(400).json({ success: false, message: "Provide contactIds array in body" });
+  }
+  if (ids.length > 20) {
+    return res.status(400).json({ success: false, message: "Max 20 contactIds per request" });
+  }
+
+  let start, end;
+  const parsed = parseMcfWindow(req.body?.startDate, req.body?.endDate);
+  if (parsed.error) {
+    const fallback = parseMcfWindow(
+      new Date(Date.now() - 90 * 24 * 60 * 60 * 1000).toISOString(),
+      new Date().toISOString()
+    );
+    start = fallback.start;
+    end = fallback.end;
+  } else {
+    start = parsed.start;
+    end = parsed.end;
+  }
+
+  const results = [];
+  const meetingProps = ["hs_createdate", "hs_meeting_start_time", "hs_timestamp", "createdAt"];
+
+  for (const contactId of ids) {
+    const trace = {
+      contactId,
+      periodStart: start.toISOString(),
+      periodEnd: end.toISOString(),
+      qualified: false,
+      reason: "",
+      meetingsInPeriod: [],
+      allMeetingsForContact: [],
+      earlierMeetings: [],
+      meetingsInPeriodLinkedToContact: [],
+    };
+
+    try {
+      // 1. Get all meetings in the period (same search as main logic)
+      const meetingsInPeriod = await searchObjects(
+        portalId, "meetings",
+        [{
+          filters: [{
+            propertyName: "hs_createdate",
+            operator: "BETWEEN",
+            value: String(start.getTime()),
+            highValue: String(end.getTime()),
+          }],
+        }],
+        meetingProps
+      );
+
+      // 2. Get meeting→contact associations for those meetings
+      const meetingIdsInPeriod = meetingsInPeriod.map((m) => m.id);
+      const meetingToContacts = await batchGetAssociations(portalId, "meetings", meetingIdsInPeriod, "contacts");
+
+      // 3. Which meetings in period are linked to this contact?
+      const linkedMeetingIds = [];
+      for (const m of meetingsInPeriod) {
+        const mContacts = meetingToContacts[m.id] || [];
+        if (mContacts.includes(contactId)) linkedMeetingIds.push(m.id);
+      }
+
+      for (const m of meetingsInPeriod) {
+        const ts = new Date(
+          m.properties?.hs_meeting_start_time ||
+          m.properties?.hs_timestamp ||
+          m.properties?.hs_createdate ||
+          m.createdAt
+        ).getTime();
+        trace.meetingsInPeriod.push({
+          id: m.id,
+          hs_createdate: m.properties?.hs_createdate,
+          hs_meeting_start_time: m.properties?.hs_meeting_start_time,
+          hs_timestamp: m.properties?.hs_timestamp,
+          createdAt: m.createdAt,
+          computedTs: ts,
+          linkedToContact: (meetingToContacts[m.id] || []).includes(contactId),
+        });
+      }
+
+      if (linkedMeetingIds.length === 0) {
+        trace.reason = "No meetings in period are associated with this contact";
+        results.push(trace);
+        continue;
+      }
+
+      // 4. Get ALL meetings for this contact
+      const contactToMeetings = await batchGetAssociations(portalId, "contacts", [contactId], "meetings");
+      const allMeetingIds = contactToMeetings[contactId] || [];
+
+      if (allMeetingIds.length === 0) {
+        trace.reason = "Contact has no meeting associations (unexpected)";
+        results.push(trace);
+        continue;
+      }
+
+      const allMeetings = await batchReadObjects(portalId, "meetings", allMeetingIds, meetingProps);
+
+      for (const m of allMeetings) {
+        const ts = new Date(
+          m.properties?.hs_meeting_start_time ||
+          m.properties?.hs_timestamp ||
+          m.properties?.hs_createdate ||
+          m.createdAt
+        ).getTime();
+        const isEarlier = !isNaN(ts) && ts < start.getTime();
+        trace.allMeetingsForContact.push({
+          id: m.id,
+          hs_createdate: m.properties?.hs_createdate,
+          hs_meeting_start_time: m.properties?.hs_meeting_start_time,
+          hs_timestamp: m.properties?.hs_timestamp,
+          createdAt: m.createdAt,
+          computedTs: ts,
+          isEarlier,
+        });
+        if (isEarlier) trace.earlierMeetings.push({ id: m.id, computedTs: ts });
+      }
+
+      if (trace.earlierMeetings.length > 0) {
+        trace.reason = `Contact has ${trace.earlierMeetings.length} meeting(s) before period start — not first-ever`;
+      } else {
+        trace.qualified = true;
+        trace.reason = "Should qualify (no earlier meetings)";
+      }
+    } catch (e) {
+      trace.reason = `Error: ${e.message}`;
+    }
+    results.push(trace);
+  }
+
+  return res.json({
+    success: true,
+    startDate: start.toISOString(),
+    endDate: end.toISOString(),
+    contacts: results,
+  });
+});
+
 /** GET /api/mcf/conversion-types — returns available conversion type options. */
 app.get("/api/mcf/conversion-types", async (_req, res) => {
   return res.json({ success: true, conversionTypes: CONVERSION_TYPE_OPTIONS });

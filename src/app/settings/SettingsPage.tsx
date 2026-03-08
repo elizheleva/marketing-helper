@@ -52,7 +52,7 @@ type McfResult = {
 
 type DateVal = { year: number; month: number; date: number };
 
-const APP_VERSION = "1.1.3";
+const APP_VERSION = "1.1.4";
 
 const CHANNEL_LABELS: Record<string, string> = {
   ORGANIC_SEARCH: "Organic Search",
@@ -82,13 +82,10 @@ const CHANNEL_TAG_VARIANT: Record<string, "default" | "success" | "warning" | "d
   UNKNOWN: "default",
 };
 
-const CONVERSION_TYPES = [
-  { label: "Form Submission (first-ever)", value: "form_submission" },
-  { label: "Meeting Booked (first-ever)", value: "meeting_booked" },
-  { label: "Deal Created (first-ever)", value: "deal_created" },
-  { label: "Closed-Won Deal (first-ever)", value: "closed_won" },
+const MCF_CONVERSION_TYPES = [
+  { label: "First-ever meeting", value: "meeting_booked" },
 ];
-const MCF_MAX_RANGE_DAYS = 183; // rolling ~6 months
+const MCF_MAX_RANGE_DAYS = 183; // max start date = 6 months ago
 
 function toDateVal(d: Date): DateVal {
   return { year: d.getFullYear(), month: d.getMonth(), date: d.getDate() };
@@ -123,7 +120,7 @@ const SettingsPage = ({ context }: AnyObj) => {
 
   // --- MCF (Paths) state ---
   const now = new Date();
-  const [mcfConversionType, setMcfConversionType] = useState("form_submission");
+  const [mcfConversionType, setMcfConversionType] = useState("meeting_booked");
   const [mcfStartDate, setMcfStartDate] = useState<DateVal>(
     toDateVal(new Date(now.getTime() - 90 * 24 * 60 * 60 * 1000))
   );
@@ -434,10 +431,17 @@ const SettingsPage = ({ context }: AnyObj) => {
         return;
       }
 
+      const maxStartDate = new Date(Date.now() - MCF_MAX_RANGE_DAYS * dayMs);
+      if (startD < maxStartDate) {
+        setMcfRunning(false);
+        setMcfMessage("Error: Start date cannot be more than 6 months ago.");
+        return;
+      }
+
       const maxDays = MCF_MAX_RANGE_DAYS * dayMs;
       if (endD.getTime() - startD.getTime() > maxDays) {
         setMcfRunning(false);
-        setMcfMessage("Error: Date range cannot exceed the last 6 months (rolling).");
+        setMcfMessage("Error: Date range cannot exceed 6 months.");
         return;
       }
 
@@ -532,10 +536,9 @@ const SettingsPage = ({ context }: AnyObj) => {
               Conversion Paths (MCF)
             </Text>
             <Text format={{ fontSize: "small" }}>
-              &bull; Inspired by Google Analytics UA &quot;Top Conversion Paths&quot; report{"\n"}
-              &bull; Pick a conversion type (Form submission, Meeting booked, Deal created, or Closed-won deal) and a date range{"\n"}
-              &bull; The app finds every first-ever conversion in that period, reconstructs the contact&apos;s full traffic-source journey leading up to it, and groups the results into ranked paths{"\n"}
-              &bull; Paths are displayed as pill-style channel labels with conversion counts and values
+              &bull; Find first-ever meetings in a date range{"\n"}
+              &bull; For each eligible contact, reconstruct the traffic-source journey (hs_latest_source history) leading up to the meeting{"\n"}
+              &bull; Results show the number of eligible conversions and ranked traffic-source paths
             </Text>
 
             <Divider />
@@ -686,15 +689,133 @@ const SettingsPage = ({ context }: AnyObj) => {
         <Tab tabId="mcf" title="Paths (MCF)">
           <Flex direction="column" gap="large">
             <Text format={{ fontWeight: "bold" }}>
-              Top Conversion Paths
+              First-ever meeting conversion paths
             </Text>
             <Text format={{ fontSize: "small" }}>
-              Replicates Google Analytics UA Multi-Channel Funnels &ldquo;Top
-              Conversion Paths&rdquo;. Select a conversion type and date range,
-              then refresh to see which traffic-source journeys lead to
-              conversions. Maximum reporting window is the last 6 months
-              (rolling).
+              Find meetings created in your chosen timeframe, keep only those
+              that are the contact&apos;s first-ever meeting, then show the
+              traffic-source journey (hs_latest_source history) for each
+              eligible contact. Maximum start date is 6 months ago.
             </Text>
+
+            <Divider />
+
+            <Select
+              label="Conversion type"
+              name="mcfConversionType"
+              value={mcfConversionType}
+              onChange={(val: string) => setMcfConversionType(val)}
+              options={MCF_CONVERSION_TYPES}
+            />
+
+            <Flex direction="row" gap="medium">
+              <DateInput
+                label="Start date"
+                name="mcfStartDate"
+                value={mcfStartDate}
+                onChange={(val: any) => {
+                  if (val) setMcfStartDate(val);
+                }}
+                format="standard"
+              />
+              <DateInput
+                label="End date"
+                name="mcfEndDate"
+                value={mcfEndDate}
+                onChange={(val: any) => {
+                  if (val) setMcfEndDate(val);
+                }}
+                format="standard"
+              />
+            </Flex>
+
+            <Button
+              onClick={startMcfRefresh}
+              disabled={mcfRunning || portalId == null}
+              variant="primary"
+            >
+              {mcfRunning ? "Running..." : "Run"}
+            </Button>
+
+            {mcfRunning && (
+              <Flex direction="row" gap="small">
+                <Tag variant="warning">Running</Tag>
+                <Text format={{ fontSize: "small" }}>{mcfMessage}</Text>
+              </Flex>
+            )}
+
+            {!mcfRunning && mcfMessage && (
+              <Text
+                format={{
+                  color: mcfMessage.startsWith("Error") ? "error" : "success",
+                }}
+              >
+                {mcfMessage}
+              </Text>
+            )}
+
+            {mcfResult && (
+              <>
+                <Divider />
+                <Text format={{ fontWeight: "bold", fontSize: "small" }}>
+                  Eligible conversions: {mcfResult.totalConversions} contact(s)
+                </Text>
+                {mcfResult.totalConversions > 0 && (
+                  <Text format={{ fontSize: "small" }}>
+                    Showing {mcfResult.paths.length} traffic-source path(s).
+                  </Text>
+                )}
+                {mcfResult.paths.length > 0 && (
+                  <Table bordered={true} paginated={mcfResult.paths.length > 10} pageCount={Math.ceil(mcfResult.paths.length / 10)}>
+                    <TableHead>
+                      <TableRow>
+                        <TableHeader width="max">
+                          Traffic source path
+                        </TableHeader>
+                        <TableHeader width="min" align="right">
+                          Contacts
+                        </TableHeader>
+                        <TableHeader width="min" align="right">
+                          Share
+                        </TableHeader>
+                      </TableRow>
+                    </TableHead>
+                    <TableBody>
+                      {mcfResult.paths.map((p) => (
+                        <TableRow key={p.pathKey}>
+                          <TableCell width="max">
+                            {renderPathPills(p.path)}
+                          </TableCell>
+                          <TableCell width="min" align="right">
+                            {p.conversions}
+                          </TableCell>
+                          <TableCell width="min" align="right">
+                            {(p.sharePct ?? (mcfResult.totalConversions > 0
+                              ? (p.conversions / mcfResult.totalConversions) * 100
+                              : 0
+                            )).toFixed(1)}%
+                          </TableCell>
+                        </TableRow>
+                      ))}
+                    </TableBody>
+                    <TableFooter>
+                      <TableRow>
+                        <TableHeader>Total</TableHeader>
+                        <TableHeader align="right">
+                          {mcfResult.paths.reduce((s, p) => s + p.conversions, 0)}
+                        </TableHeader>
+                        <TableHeader align="right">100%</TableHeader>
+                      </TableRow>
+                    </TableFooter>
+                  </Table>
+                )}
+                {mcfResult.paths.length === 0 && mcfResult.totalConversions === 0 && (
+                  <Text format={{ fontSize: "small", color: "subtle" }}>
+                    No eligible first-ever meetings found in this timeframe.
+                  </Text>
+                )}
+              </>
+            )}
           </Flex>
         </Tab>
 

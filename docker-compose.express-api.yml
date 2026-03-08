@@ -1,0 +1,13 @@
+# Reference: add this to your express-api service in /root/docker-compose.yml
+# CRITICAL: This volume persists OAuth tokens across redeploys.
+# Without it, users must reinstall the app after every deploy.
+
+services:
+  express-api:
+    build:
+      context: ./express-api
+      dockerfile: Dockerfile
+    volumes:
+      # Persist tokens, portal config, MCF results — survives container rebuilds
+      - /root/express-api-data:/app/data
+    # ... your existing env, ports, labels, etc.

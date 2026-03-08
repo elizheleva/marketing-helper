@@ -99,14 +99,19 @@ The backend runs on a VPS (46.202.194.179) with Docker Compose. Use Git-based de
    git clone https://github.com/elizheleva/marketing-helper.git express-api
    ```
 
-3. Ensure your `docker-compose.yml` at `/root/docker-compose.yml` has an `express-api` service with build context pointing to `./express-api`:
+3. Ensure your `docker-compose.yml` at `/root/docker-compose.yml` has an `express-api` service with:
+   - Build context: `./express-api`
+   - **Volume for persistent data** (tokens survive redeploys; without this, users must reinstall after every deploy):
    ```yaml
    express-api:
      build:
        context: ./express-api
        dockerfile: Dockerfile
-     # ... rest of your config (env, volumes, etc.)
+     volumes:
+       - /root/express-api-data:/app/data
+     # ... rest of your config (env, ports, labels, etc.)
    ```
+   Create the data directory: `mkdir -p /root/express-api-data`
 
 4. Make the deploy script executable:
    ```bash

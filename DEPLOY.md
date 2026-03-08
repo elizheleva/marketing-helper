@@ -58,10 +58,23 @@ mv express-api express-api.bak 2>/dev/null || true
 git clone https://github.com/elizheleva/marketing-helper.git express-api
 ```
 
-**Step 2.3** – Copy data from backup (if you had a previous setup):
+**Step 2.3** – **Persist tokens (required)** – Create data directory and add volume to docker-compose:
 
 ```bash
-cp -r /root/express-api.bak/data /root/express-api/ 2>/dev/null || true
+mkdir -p /root/express-api-data
+```
+
+Edit `/root/docker-compose.yml` and add this volume to the `express-api` service:
+
+```yaml
+volumes:
+  - /root/express-api-data:/app/data
+```
+
+If you had a previous setup with tokens, copy them into the persistent folder:
+
+```bash
+cp -r /root/express-api.bak/data/* /root/express-api-data/ 2>/dev/null || true
 ```
 
 ---
@@ -156,8 +169,55 @@ hs project upload
 
 ---
 
+## Persist tokens (run once)
+
+**Where:** **SSH**
+
+Tokens are lost on every redeploy unless you use a persistent volume. Run this **once**:
+
+**Step 1** – Create data directory:
+
+```bash
+mkdir -p /root/express-api-data
+```
+
+**Step 2** – Edit docker-compose and add the volume. Run:
+
+```bash
+nano /root/docker-compose.yml
+```
+
+Find the `express-api` service. Under it, add (or merge into existing `volumes:`):
+
+```yaml
+    volumes:
+      - /root/express-api-data:/app/data
+```
+
+Save (Ctrl+O, Enter, Ctrl+X).
+
+**Step 3** – If you have existing tokens in a backup, copy them:
+
+```bash
+cp /root/express-api.bak/data/hubspot-tokens.json /root/express-api-data/ 2>/dev/null || true
+cp /root/express-api.bak/data/portal-config.json /root/express-api-data/ 2>/dev/null || true
+cp /root/express-api.bak/data/mcf-results.json /root/express-api-data/ 2>/dev/null || true
+```
+
+**Step 4** – Rebuild and restart:
+
+```bash
+cd /root
+docker compose build express-api --no-cache
+docker compose up -d express-api
+```
+
+After this, tokens persist across all future redeploys. Users will not need to reinstall.
+
+---
+
 ## Verify deployment
 
-- **Backend:** https://api.uspeh.co.uk/api/version → `{"version":"1.1.6"}`
+- **Backend:** https://api.uspeh.co.uk/api/version → `{"version":"1.1.7"}`
 - **HubSpot:** Open Marketing Helper settings in HubSpot, run Paths report.
 - **Legacy error:** Should be gone. If you still see `firstDealByContact`, the VPS is running old code – rerun Step 3.

@@ -1,7 +1,7 @@
 // server.js
 // HubSpot OAuth installer + Marketing Contribution backend
 // BACKEND_VERSION: bump when deploying (no legacy firstDealByContact)
-const BACKEND_VERSION = "1.1.7";
+const BACKEND_VERSION = "1.1.8";
 
 const express = require("express");
 const fs = require("fs");
@@ -445,7 +445,8 @@ async function batchReadObjects(portalId, objectType, ids, properties, propertie
 
 /**
  * Batch get associations using CRM v4 batch API.
- * Returns a map: { fromId → [toId, ...] }
+ * Returns a map: { fromId → [toId, ...] } (all IDs as strings).
+ * Handles pagination when a single object has many associations.
  * Falls back to individual v3 calls if v4 fails.
  */
 async function batchGetAssociations(portalId, fromType, fromIds, toType) {
@@ -454,32 +455,43 @@ async function batchGetAssociations(portalId, fromType, fromIds, toType) {
   const batchSize = 100;
 
   for (let i = 0; i < fromIds.length; i += batchSize) {
-    const batch = fromIds.slice(i, i + batchSize);
-    const body = { inputs: batch.map((id) => ({ id: String(id) })) };
+    const batch = fromIds.slice(i, i + batchSize).map((id) => String(id));
+    let inputs = batch.map((id) => ({ id }));
 
-    try {
-      const data = await hubspotApiWithRetry(
-        portalId,
-        `https://api.hubapi.com/crm/v4/associations/${fromType}/${toType}/batch/read`,
-        { method: "POST", body: JSON.stringify(body) }
-      );
-      for (const r of data.results || []) {
-        const fromId = String(r.from?.id);
-        resultMap[fromId] = (r.to || []).map((t) => String(t.toObjectId));
-      }
-    } catch (e) {
-      console.warn(`batchGetAssociations v4 ${fromType}->${toType} failed at ${i}, falling back:`, e.message);
-      // Fallback to individual v3 calls
-      for (const id of batch) {
-        try {
-          const data = await hubspotApiWithRetry(
-            portalId,
-            `https://api.hubapi.com/crm/v3/objects/${fromType}/${id}/associations/${toType}?limit=500`
-          );
-          resultMap[String(id)] = (data.results || []).map((r) => String(r.toObjectId || r.id));
-        } catch (_) {
-          resultMap[String(id)] = [];
+    while (inputs.length > 0) {
+      const body = { inputs };
+      try {
+        const data = await hubspotApiWithRetry(
+          portalId,
+          `https://api.hubapi.com/crm/v4/associations/${fromType}/${toType}/batch/read`,
+          { method: "POST", body: JSON.stringify(body) }
+        );
+        inputs = [];
+        for (const r of data.results || []) {
+          const fromId = String(r.from?.id ?? r.from);
+          const toIds = (r.to || []).map((t) => String(t.toObjectId ?? t.id ?? t)).filter(Boolean);
+          if (!resultMap[fromId]) resultMap[fromId] = [];
+          resultMap[fromId].push(...toIds);
+          if (r.paging?.next?.after) {
+            inputs.push({ id: fromId, after: r.paging.next.after });
+          }
         }
+        if (inputs.length > 0) await msDelay(150);
+      } catch (e) {
+        console.warn(`batchGetAssociations v4 ${fromType}->${toType} failed, falling back to v3:`, e.message);
+        for (const id of batch) {
+          try {
+            const data = await hubspotApiWithRetry(
+              portalId,
+              `https://api.hubapi.com/crm/v3/objects/${fromType}/${id}/associations/${toType}?limit=500`,
+              { method: "GET" }
+            );
+            resultMap[String(id)] = (data.results || []).map((r) => String(r.toObjectId || r.id));
+          } catch (_) {
+            resultMap[String(id)] = [];
+          }
+        }
+        break;
       }
     }
 
@@ -533,6 +545,7 @@ async function findMeetingBookedConversions(portalId, start, end, jobStatus) {
   const meetingAssocs = await batchGetAssociations(portalId, "meetings", meetingIds, "contacts");
 
   // Build contactMap: contactId → earliest meeting timestamp in period
+  // Use String() for all IDs to avoid type mismatch (HubSpot may return numbers)
   const contactMap = {};
   for (const m of meetings) {
     const mTs = new Date(
@@ -542,9 +555,11 @@ async function findMeetingBookedConversions(portalId, start, end, jobStatus) {
       m.createdAt
     ).getTime();
 
-    const contactIds = meetingAssocs[m.id] || [];
+    const meetingKey = String(m.id);
+    const contactIds = meetingAssocs[meetingKey] || [];
     for (const cId of contactIds) {
-      if (!contactMap[cId] || mTs < contactMap[cId]) contactMap[cId] = mTs;
+      const cKey = String(cId);
+      if (!contactMap[cKey] || mTs < contactMap[cKey]) contactMap[cKey] = mTs;
     }
   }
 

@@ -63,7 +63,7 @@ type McfResult = {
 
 type DateVal = { year: number; month: number; date: number };
 
-const APP_VERSION = "1.1.7";
+const APP_VERSION = "1.1.8";
 
 const CHANNEL_LABELS: Record<string, string> = {
   ORGANIC_SEARCH: "Organic Search",

@@ -52,7 +52,7 @@ type McfResult = {
 
 type DateVal = { year: number; month: number; date: number };
 
-const APP_VERSION = "1.1.4";
+const APP_VERSION = "1.1.5";
 
 const CHANNEL_LABELS: Record<string, string> = {
   ORGANIC_SEARCH: "Organic Search",
@@ -337,7 +337,7 @@ const SettingsPage = ({ context }: AnyObj) => {
         { method: "GET" }
       );
       const data = await resp.json();
-      if (data.success && data.paths && data.paths.length > 0) {
+      if (data.success && (data.totalConversions !== undefined || (data.paths && data.paths.length > 0))) {
         setMcfResult(data as McfResult);
       } else {
         setMcfResult(null);

@@ -2,6 +2,9 @@
 
 IMPORTANT: IF THE 'HubSpotDev' MCP SERVER IS INSTALLED USE THE TOOLS BEFORE TRYING TO MANUALLY USE CLI COMMANDS OR BEFORE TRYING TO DO ANYTHING WITH HUBSPOT ASSETS
 
+## Deployment
+- **Before every redeploy/upload**: Bump the version number in BOTH `package.json` and `src/app/settings/SettingsPage.tsx` (APP_VERSION constant). Use semantic versioning: patch (1.1.x) for bug fixes, minor (1.x.0) for new features.
+
 ## HubSpot Project Information
 - The project configuration is in the `hsproject.json` file
 - A directory is considered a part of the project if it or a directory above it contains a `hsproject.json` file

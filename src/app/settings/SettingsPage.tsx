@@ -52,7 +52,7 @@ type McfResult = {
 
 type DateVal = { year: number; month: number; date: number };
 
-const APP_VERSION = "1.1.0";
+const APP_VERSION = "1.1.3";
 
 const CHANNEL_LABELS: Record<string, string> = {
   ORGANIC_SEARCH: "Organic Search",
@@ -99,6 +99,8 @@ function fromDateVal(dv: DateVal): Date {
 }
 
 const SettingsPage = ({ context }: AnyObj) => {
+  const portalId = context?.portal?.id ?? context?.accountId ?? context?.portalId;
+
   // --- Analysis state ---
   const [analysisRunning, setAnalysisRunning] = useState(false);
   const [analysisMessage, setAnalysisMessage] = useState("");
@@ -331,8 +333,10 @@ const SettingsPage = ({ context }: AnyObj) => {
     setMcfLoadingResult(true);
     try {
       const ct = convType || mcfConversionType;
+      const q = new URLSearchParams({ conversionType: ct });
+      if (portalId != null) q.set("portalId", String(portalId));
       const resp = await hubspot.fetch(
-        `${BACKEND_URL}/api/mcf/result?conversionType=${ct}`,
+        `${BACKEND_URL}/api/mcf/result?${q.toString()}`,
         { method: "GET" }
       );
       const data = await resp.json();
@@ -351,8 +355,9 @@ const SettingsPage = ({ context }: AnyObj) => {
   /** Check MCF job status; if running, start polling. */
   const checkMcfStatus = async () => {
     try {
+      const q = portalId != null ? `?portalId=${portalId}` : "";
       const resp = await hubspot.fetch(
-        `${BACKEND_URL}/api/mcf/status`,
+        `${BACKEND_URL}/api/mcf/status${q}`,
         { method: "GET" }
       );
       const data = await resp.json();
@@ -377,8 +382,9 @@ const SettingsPage = ({ context }: AnyObj) => {
   const pollMcfStatus = () => {
     const poll = async () => {
       try {
+        const q = portalId != null ? `?portalId=${portalId}` : "";
         const resp = await hubspot.fetch(
-          `${BACKEND_URL}/api/mcf/status`,
+          `${BACKEND_URL}/api/mcf/status${q}`,
           { method: "GET" }
         );
         const data = await resp.json();
@@ -408,6 +414,11 @@ const SettingsPage = ({ context }: AnyObj) => {
 
   /** Start an MCF refresh job. */
   const startMcfRefresh = async () => {
+    if (portalId == null) {
+      setMcfMessage("Error: Unable to determine HubSpot account. Please refresh the page.");
+      return;
+    }
+
     setMcfRunning(true);
     setMcfMessage("Starting MCF analysis...");
     setMcfResult(null);
@@ -431,10 +442,11 @@ const SettingsPage = ({ context }: AnyObj) => {
       }
 
       const resp = await hubspot.fetch(
-        `${BACKEND_URL}/api/mcf/refresh`,
+        `${BACKEND_URL}/api/mcf/refresh?portalId=${portalId}`,
         {
           method: "POST",
           body: {
+            portalId: String(portalId),
             conversionType: mcfConversionType,
             startDate: startD.toISOString(),
             endDate: endD.toISOString(),
@@ -443,9 +455,10 @@ const SettingsPage = ({ context }: AnyObj) => {
       );
       const data = await resp.json();
 
-      if (!data.success) {
+      if (!resp.ok || !data.success) {
         setMcfRunning(false);
-        setMcfMessage(data.message || "Failed to start.");
+        const msg = data?.message || `Request failed (${resp.status}). Please try again.`;
+        setMcfMessage(msg.startsWith("Error") ? msg : `Error: ${msg}`);
         return;
       }
 
@@ -476,11 +489,11 @@ const SettingsPage = ({ context }: AnyObj) => {
     </Flex>
   );
 
-  // Load MCF results and check status on mount
+  // Load MCF results and check status on mount (and when portalId becomes available)
   useEffect(() => {
     checkMcfStatus();
     loadMcfResult();
-  }, []);
+  }, [portalId]);
 
   // Determine button state
   const buttonDisabled = analysisRunning || !analysisAllowed;
@@ -682,186 +695,6 @@ const SettingsPage = ({ context }: AnyObj) => {
               conversions. Maximum reporting window is the last 6 months
               (rolling).
             </Text>
-
-            <Divider />
-
-            {/* ---- Filters ---- */}
-            <Flex direction="column" gap="medium">
-              <Select
-                label="Conversion Type"
-                name="mcfConversionType"
-                value={mcfConversionType}
-                onChange={(val: string) => {
-                  setMcfConversionType(val);
-                  loadMcfResult(val);
-                }}
-                options={CONVERSION_TYPES}
-              />
-
-              <Flex direction="row" gap="medium">
-                <DateInput
-                  label="Start Date"
-                  name="mcfStartDate"
-                  value={mcfStartDate}
-                  onChange={(val: any) => {
-                    if (val) setMcfStartDate(val);
-                  }}
-                  format="standard"
-                />
-                <DateInput
-                  label="End Date"
-                  name="mcfEndDate"
-                  value={mcfEndDate}
-                  onChange={(val: any) => {
-                    if (val) setMcfEndDate(val);
-                  }}
-                  format="standard"
-                />
-              </Flex>
-
-            </Flex>
-
-            <Flex direction="row" gap="small">
-              <Button
-                onClick={startMcfRefresh}
-                disabled={mcfRunning}
-                variant="primary"
-              >
-                {mcfRunning ? "Refreshing..." : "Refresh Paths"}
-              </Button>
-              {mcfResult && (
-                <Text format={{ fontSize: "small", color: "subtle" }}>
-                  Last refreshed: {formatTimestamp(mcfResult.refreshedAt)}
-                </Text>
-              )}
-            </Flex>
-
-            {/* ---- Status / progress ---- */}
-            {mcfRunning && (
-              <Flex direction="row" gap="small">
-                <Tag variant="warning">Running</Tag>
-                <Text format={{ fontSize: "small" }}>{mcfMessage}</Text>
-              </Flex>
-            )}
-
-            {!mcfRunning && mcfMessage && (
-              <Text
-                format={{
-                  color: mcfMessage.startsWith("Error") ? "error" : "success",
-                }}
-              >
-                {mcfMessage}
-              </Text>
-            )}
-
-            <Divider />
-
-            {/* ---- Mixed currencies warning ---- */}
-            {mcfResult?.mixedCurrencies && (
-              <Flex direction="row" gap="small">
-                <Tag variant="warning">Mixed Currencies</Tag>
-                <Text format={{ fontSize: "small" }}>
-                  Conversion values include multiple currencies (
-                  {mcfResult.currencies.join(", ")}). Values shown are raw sums
-                  without currency conversion.
-                </Text>
-              </Flex>
-            )}
-
-            {/* ---- Results summary ---- */}
-            {mcfResult && (
-              <Flex direction="column" gap="small">
-                <Text format={{ fontSize: "small" }}>
-                  {mcfResult.totalConversions} first-ever conversion(s) found.
-                  Showing {mcfResult.paths.length} ranked path(s).
-                </Text>
-              </Flex>
-            )}
-
-            {/* ---- MCF Table ---- */}
-            {mcfLoadingResult && !mcfResult && (
-              <Text format={{ fontSize: "small", color: "subtle" }}>
-                Loading results...
-              </Text>
-            )}
-
-            {mcfResult && mcfResult.paths.length > 0 && (
-              <Table bordered={true} paginated={mcfResult.paths.length > 10} pageCount={Math.ceil(mcfResult.paths.length / 10)}>
-                <TableHead>
-                  <TableRow>
-                    <TableHeader width="max">
-                      MCF Channel Grouping Path
-                    </TableHeader>
-                    <TableHeader width="min" align="right">
-                      Conversions
-                    </TableHeader>
-                    <TableHeader width="min" align="right">
-                      Share
-                    </TableHeader>
-                    <TableHeader width="min" align="right">
-                      Conv. Value
-                    </TableHeader>
-                  </TableRow>
-                </TableHead>
-                <TableBody>
-                  {mcfResult.paths.map((p) => (
-                    <TableRow key={p.pathKey}>
-                      <TableCell width="max">
-                        {renderPathPills(p.path)}
-                      </TableCell>
-                      <TableCell width="min" align="right">
-                        {p.conversions}
-                      </TableCell>
-                      <TableCell width="min" align="right">
-                        {(p.sharePct ?? (mcfResult.totalConversions > 0
-                          ? (p.conversions / mcfResult.totalConversions) * 100
-                          : 0
-                        )).toFixed(2)}%
-                      </TableCell>
-                      <TableCell width="min" align="right">
-                        {p.conversionValue > 0
-                          ? p.currencies.length === 1
-                            ? `${p.currencies[0]} ${p.conversionValue.toLocaleString()}`
-                            : p.conversionValue.toLocaleString()
-                          : "\u2014"}
-                      </TableCell>
-                    </TableRow>
-                  ))}
-                </TableBody>
-                <TableFooter>
-                  <TableRow>
-                    <TableHeader>Total</TableHeader>
-                    <TableHeader align="right">
-                      {mcfResult.paths.reduce((s, p) => s + p.conversions, 0)}
-                    </TableHeader>
-                    <TableHeader align="right">100%</TableHeader>
-                    <TableHeader align="right">
-                      {mcfResult.paths.reduce((s, p) => s + p.conversionValue, 0) > 0
-                        ? mcfResult.paths
-                            .reduce((s, p) => s + p.conversionValue, 0)
-                            .toLocaleString()
-                        : "\u2014"}
-                    </TableHeader>
-                  </TableRow>
-                </TableFooter>
-              </Table>
-            )}
-
-            {mcfResult && mcfResult.paths.length === 0 && !mcfRunning && (
-              <Flex direction="column" gap="small">
-                <Text format={{ fontSize: "small", color: "subtle" }}>
-                  No paths found for this configuration. Try changing the
-                  conversion type or date range.
-                </Text>
-              </Flex>
-            )}
-
-            {!mcfResult && !mcfRunning && !mcfLoadingResult && (
-              <Text format={{ fontSize: "small", color: "subtle" }}>
-                Click &ldquo;Refresh Paths&rdquo; to analyse your
-                contacts&rsquo; conversion journeys.
-              </Text>
-            )}
           </Flex>
         </Tab>
 

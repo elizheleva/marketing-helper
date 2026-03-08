@@ -671,7 +671,7 @@ async function findMeetingBookedConversions(portalId, start, end, jobStatus) {
     }
 
     if ((i + 1) % 10 === 0) {
-      jobStatus.message = `Step 3/3: Verified ${i + 1}/${uniqueContacts.length} contacts. ${Object.keys(firstDealByContact).length} contacts with first-ever candidates so far.`;
+      jobStatus.message = `Step 3/3: Verified ${i + 1}/${uniqueContacts.length} contacts. ${conversions.length} qualifying so far.`;
       await msDelay(100);
     }
   }
@@ -765,7 +765,7 @@ async function findDealCreatedConversions(portalId, start, end, jobStatus) {
     }
 
     if ((i + 1) % 10 === 0) {
-      jobStatus.message = `Step 3/3: Verified ${i + 1}/${uniqueContacts.length} contacts. ${conversions.length} qualifying so far.`;
+      jobStatus.message = `Step 3/3: Verified ${i + 1}/${uniqueContacts.length} contacts. ${Object.keys(firstDealByContact).length} with first-ever candidates so far.`;
       await msDelay(100);
     }
   }
@@ -983,6 +983,7 @@ async function findClosedWonConversions(portalId, start, end, jobStatus) {
 
 /**
  * Ensure the marketing_contribution_percentage property exists.
+ * Property must be type "number" with numberDisplayHint "percentage" (not "formatted_number").
  */
 async function ensurePropertyExists(portalId) {
   const propertyDefinition = {
@@ -999,6 +1000,26 @@ async function ensurePropertyExists(portalId) {
     displayOrder: -1,
   };
 
+  const patchToNumberAndPercentage = () =>
+    hubspotApi(
+      portalId,
+      `https://api.hubapi.com/crm/v3/properties/contacts/${PROPERTY_NAME}`,
+      {
+        method: "PATCH",
+        body: JSON.stringify({
+          label: propertyDefinition.label,
+          description: propertyDefinition.description,
+          groupName: propertyDefinition.groupName,
+          type: "number",
+          fieldType: "number",
+          numberDisplayHint: "percentage",
+          hidden: propertyDefinition.hidden,
+          formField: propertyDefinition.formField,
+          displayOrder: propertyDefinition.displayOrder,
+        }),
+      }
+    );
+
   try {
     const existing = await hubspotApi(
       portalId,
@@ -1006,35 +1027,22 @@ async function ensurePropertyExists(portalId) {
       { method: "GET" }
     );
 
-    // Keep legacy portals in sync: ensure this property is number + percentage display.
+    // Ensure number type + percentage display (not formatted_number).
+    const hasFormattedNumber =
+      existing?.numberDisplayHint === "formatted_number" ||
+      (existing?.type === "number" && !existing?.numberDisplayHint);
     const needsUpdate =
       existing?.type !== "number" ||
       existing?.fieldType !== "number" ||
-      existing?.numberDisplayHint !== "percentage";
+      existing?.numberDisplayHint !== "percentage" ||
+      hasFormattedNumber;
 
     if (needsUpdate) {
-      await hubspotApi(
-        portalId,
-        `https://api.hubapi.com/crm/v3/properties/contacts/${PROPERTY_NAME}`,
-        {
-          method: "PATCH",
-          body: JSON.stringify({
-            label: propertyDefinition.label,
-            description: propertyDefinition.description,
-            groupName: propertyDefinition.groupName,
-            type: propertyDefinition.type,
-            fieldType: propertyDefinition.fieldType,
-            numberDisplayHint: propertyDefinition.numberDisplayHint,
-            hidden: propertyDefinition.hidden,
-            formField: propertyDefinition.formField,
-            displayOrder: propertyDefinition.displayOrder,
-          }),
-        }
-      );
+      await patchToNumberAndPercentage();
       return "updated";
     }
 
-    return false; // already exists and has expected settings
+    return false; // already exists with number + percentage settings
   } catch (e) {
     if (e?.status !== 404) throw e;
   }
@@ -1047,6 +1055,9 @@ async function ensurePropertyExists(portalId) {
       body: JSON.stringify(propertyDefinition),
     }
   );
+  // PATCH immediately after create to ensure numberDisplayHint "percentage" is applied
+  // (some HubSpot APIs default to "formatted_number" on create).
+  await patchToNumberAndPercentage();
   return true; // created
 }
 
@@ -1540,16 +1551,20 @@ async function getMcfConversionsForType(portalId, conversionType, start, end, jo
  *  DOES NOT iterate over all contacts — only touches converting entities.
  */
 app.post("/api/mcf/refresh", async (req, res) => {
-  const portalId = req.query.portalId;
+  const body = req.body || {};
+  const portalId = req.query.portalId || body.portalId || body.portal_id;
   if (!portalId) {
-    return res.status(400).json({ success: false, message: "Missing portalId" });
+    return res.status(400).json({
+      success: false,
+      message: "Missing portalId. Ensure the settings page has access to the HubSpot account context.",
+    });
   }
 
   const {
     conversionType = "form_submission",
     startDate,
     endDate,
-  } = req.body || {};
+  } = body;
 
   const validTypes = ["form_submission", "meeting_booked", "deal_created", "closed_won"];
   if (!validTypes.includes(conversionType)) {
